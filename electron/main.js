@@ -6,6 +6,7 @@ import { fetchDetections } from './eset-source.js';
 import { scoreDetection } from './eset-scoring.js';
 import squirrelStartup from 'electron-squirrel-startup';
 import { icons } from './icons';
+import auth from './auth.js';
 
 // Handle Squirrel.Windows install/update/uninstall events — must quit immediately.
 if (squirrelStartup) app.quit();
@@ -607,7 +608,7 @@ function statusLabel(s) {
 
 function buildContextMenu() {
   const items = [{ label: 'ESET Alert Monitor', enabled: false }];
-  const snap = (currentConnectionState === 'live') ? overallSnapshot() : null;
+  const snap = (auth.currentUser() && currentConnectionState === 'live') ? overallSnapshot() : null;
   if (!snap) {
     items.push({ label: `Status: ${statusLabel(currentConnectionState)}`, enabled: false });
   } else {
@@ -636,7 +637,11 @@ let lastTrayStatus = 'grey';
 function updateTray(status) {
   if (!tray) return;
   lastTrayStatus = status;
-  tray.setImage(icons[status] || icons.grey);
+  // No status is revealed until someone is signed in — the tray icon stays
+  // neutral grey while signed out.
+  const signedIn = !!auth.currentUser();
+  const effective = signedIn ? status : 'grey';
+  tray.setImage(icons[effective] || icons.grey);
   // No OS tooltip at all on the tray icon (hovering opens the popover instead).
   tray.setToolTip('');
 }
@@ -1025,6 +1030,12 @@ function dashboardIndexPath() {
   return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
 }
 
+// The dashboard markup (dashboard/index.html) is the canonical default layout —
+// a brand-new account just renders it. This used to seed a saved "Baxley"
+// snapshot from default-layout.json, which kept resurrecting the old layout
+// (gauge + count cards) over the current default, so seeding is disabled.
+function seedDefaultLayoutForUser() {}
+
 function createDashboardWindow() {
   if (dashboardWindow && !dashboardWindow.isDestroyed()) {
     dashboardWindow.show();
@@ -1053,6 +1064,7 @@ function createDashboardWindow() {
     },
   });
 
+  seedDefaultLayoutForUser(auth.currentUser());
   dashboardWindow.loadFile(dashboardIndexPath());
 
   dashboardWindow.once('ready-to-show', () => {
@@ -1118,14 +1130,15 @@ app.whenReady().then(() => {
   if (app.dock) app.dock.hide();
 
   roster = loadRoster();
-  loadPingsCache(); // restore per-host detection history before live data resumes
+  loadPingsCache(); // restore per-company ping history before live data resumes
+  auth.init();
 
   tray = new Tray(icons.grey);
   updateTray('grey');
   createWindow();
 
-  // The dashboard is the primary surface — open it on launch (the tray popover
-  // remains available from the tray icon).
+  // The dashboard is the primary surface: open it on launch so users sign in
+  // and land on it by default (the tray popover remains available).
   openDashboardWindow();
 
   // LEFT click toggles the popover near the tray icon.
@@ -1511,6 +1524,66 @@ ipcMain.handle('dashboard-window:close', (e) => {
   dashboardWindow.close();
   return { ok: true };
 });
+
+// ─── Accounts / auth ─────────────────────────────────────────────────────────
+
+function broadcastAuth() {
+  const payload = auth.session();
+  BrowserWindow.getAllWindows().forEach((w) => {
+    if (w && !w.isDestroyed()) w.webContents.send('auth:changed', payload);
+  });
+}
+
+function canManageUsers() {
+  const s = auth.session();
+  return !!(s.user && (s.user.isAdmin || s.user.permissions.canManageUsers));
+}
+
+ipcMain.handle('auth:session', () => auth.session());
+
+ipcMain.handle('auth:login', (_e, { username, password } = {}) => {
+  const result = auth.login(username, password);
+  if (result.ok) { seedDefaultLayoutForUser(auth.currentUser()); broadcastAuth(); updateTray(lastTrayStatus); }
+  return result;
+});
+
+ipcMain.handle('auth:logout', () => {
+  const result = auth.logout();
+  broadcastAuth();
+  updateTray(lastTrayStatus);
+  return result;
+});
+
+ipcMain.handle('auth:register', (_e, payload) => {
+  const result = auth.register(payload || {});
+  if (result.ok) { seedDefaultLayoutForUser(auth.currentUser()); broadcastAuth(); updateTray(lastTrayStatus); }
+  return result;
+});
+
+ipcMain.handle('auth:set-password', (_e, { password } = {}) => {
+  const result = auth.setOwnPassword(password);
+  if (result.ok) broadcastAuth();
+  return result;
+});
+
+ipcMain.handle('auth:list-users', () => (
+  canManageUsers() ? { ok: true, users: auth.listUsers() } : { ok: false, error: 'Not allowed' }
+));
+
+ipcMain.handle('auth:create-user', (_e, payload) => (
+  canManageUsers() ? auth.createUser(payload || {}) : { ok: false, error: 'Not allowed' }
+));
+
+ipcMain.handle('auth:update-user', (_e, { username, ...rest } = {}) => (
+  canManageUsers() ? auth.updateUser(username, rest) : { ok: false, error: 'Not allowed' }
+));
+
+ipcMain.handle('auth:delete-user', (_e, { username } = {}) => (
+  canManageUsers() ? auth.deleteUser(username) : { ok: false, error: 'Not allowed' }
+));
+
+// Synchronous lookup so a preload can pick the signed-in user's layout store.
+ipcMain.on('auth:current-username', (e) => { e.returnValue = auth.currentUser() || ''; });
 
 ipcMain.handle('history:get', async () => {
   // The ESET source has no REST history endpoint; live detections arrive through

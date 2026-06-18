@@ -716,6 +716,8 @@ function publish() {
     "widget-maxms": { rows },                 // Max score   = max(score)
     "widget-fails": { rows: failRows },       // Open        = count(open detections)
     "widget-sincedown": { rows: failRows },   // Last detection = max(checkedAtMs) of open
+    // Escalations panel — only Critical detections (the ones that escalate).
+    "widget-escalations": { rows: rows.filter((r) => r.severity === "Critical") },
   };
 
   // EVERY tab (1, 2, or 3+ viewers) shows its viewers as panels beneath the

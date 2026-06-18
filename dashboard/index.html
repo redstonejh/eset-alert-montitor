@@ -221,7 +221,11 @@
   </div>
 
   <div class="widget-layout" data-widget-layout-key="builder-table">
-    <div class="widget-card" data-widget-key="widget-history" data-widget-type="table" data-widget-runtime-type="table" data-widget-config='{"title":"Detections","columns":["Time","Host","Threat","User","Severity","Score","State"],"sortBy":"checkedAt","sortDirection":"desc","limit":2000}' data-default-span="6" data-default-grid-col="1" data-default-grid-row="5" data-grid-col="1" data-grid-row="5" data-grid-row-span="3"></div>
+    <div class="widget-card" data-widget-key="widget-history" data-widget-type="table" data-widget-runtime-type="table" data-widget-config='{"title":"Alerts","columns":["Time","Host","Threat","User","Severity","Score","State"],"sortBy":"checkedAt","sortDirection":"desc","limit":2000}' data-default-span="6" data-default-grid-col="1" data-default-grid-row="5" data-grid-col="1" data-grid-row="5" data-grid-row-span="3"></div>
+  </div>
+
+  <div class="widget-layout" data-widget-layout-key="builder-escalations">
+    <div class="widget-card" data-widget-key="widget-escalations" data-widget-type="table" data-widget-runtime-type="table" data-widget-config='{"title":"Escalations","columns":["Time","Host","Threat","User","Severity","Score","State"],"sortBy":"checkedAt","sortDirection":"desc","limit":2000}' data-default-span="6" data-default-grid-col="1" data-default-grid-row="8" data-grid-col="1" data-grid-row="8" data-grid-row-span="3"></div>
   </div>
 </div>
 
@@ -241,5 +245,6 @@
   <div class="toast-stack" aria-live="polite" aria-atomic="true"></div>
   <script type="module" src="./app/static/app.js"></script>
   <script type="module" src="./app/static/status-feed.js"></script>
+  <script type="module" src="./app/static/auth-ui.js"></script>
 </body>
 </html>
