@@ -1,0 +1,1578 @@
+import { app, BrowserWindow, Tray, Menu, ipcMain, shell, Notification, screen } from 'electron';
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import { fetchDetections } from './eset-source.js';
+import squirrelStartup from 'electron-squirrel-startup';
+import { icons } from './icons';
+import auth from './auth.js';
+
+// Handle Squirrel.Windows install/update/uninstall events — must quit immediately.
+if (squirrelStartup) app.quit();
+
+// Kill the default application menu (File/Edit/View/Window/Help) for a chrome-free
+// tray popover. Must be called before any window is created.
+Menu.setApplicationMenu(null);
+
+// ─── Settings persistence ─────────────────────────────────────────────────────
+
+const SETTINGS_FILE = path.join(app.getPath('userData'), 'settings.json');
+
+const DEFAULT_SETTINGS = {
+  esetRegion: 'us',       // eu | de | us | ca
+  esetUsername: '',       // ESET Connect API-User username
+  esetPassword: '',       // ESET Connect API-User password
+  esetBaseUrl: '',        // optional override of the detections host
+  esetAuthUrl: '',        // optional override of the OAuth token endpoint
+  pollIntervalSec: 60,    // how often to poll the ESET API
+  lookbackHours: 24,      // how far back each poll queries detections
+};
+
+// Maps monitored checks → companies (dashboard tabs). Editable JSON shipped with
+// the app; loaded at startup. Empty companies[] => one tab per check (auto-named).
+function clientsConfigPath() {
+  const candidates = [
+    path.join(app.getPath('userData'), 'clients.json'),
+    app.isPackaged ? path.join(process.resourcesPath, 'clients.json') : '',
+    path.join(__dirname, '..', 'clients.json'),
+  ].filter(Boolean);
+  return candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } }) || candidates[candidates.length - 1];
+}
+function loadClients() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(clientsConfigPath(), 'utf8'));
+    return { companies: Array.isArray(cfg.companies) ? cfg.companies : [] };
+  } catch {
+    return { companies: [] };
+  }
+}
+
+function loadSettings() {
+  try {
+    return { ...DEFAULT_SETTINGS, ...JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')) };
+  } catch {
+    return { ...DEFAULT_SETTINGS };
+  }
+}
+
+function saveSettings(settings) {
+  fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true });
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+}
+
+// ─── App state ────────────────────────────────────────────────────────────────
+
+let tray = null;
+let mainWindow = null;
+let dashboardWindow = null;
+let esetTimer = null;
+let currentStatus = null;        // most recent status payload
+let currentConnectionState = 'grey'; // 'grey' | 'live' | 'black'
+let lastCheckedAt = null;        // checkedAt from most recent message
+let settings = loadSettings();
+let clientsConfig = loadClients();
+// companyId -> { id, label, pings: [...], lastByCheck: Map<checkId, ping> }
+const companies = new Map();
+// Persistent roster of every company ever seen: id -> { id, label, lastSeen }.
+// Lets offline clients keep their tab (shown grey) when their checks go quiet.
+let roster = new Map();
+// "<projectId>/<systemId>" -> last activity (ms). Fed by heartbeats and any
+// check/connection message, so a company is online whenever its monitoring
+// agent is alive — even if an individual circuit check publishes slowly.
+const systemActivity = new Map();
+let isQuitting = false;
+let popoverMode = 'peek';        // 'peek' | 'expanded'
+let popoverPinned = false;
+let pointerInPopover = false;
+let pointerInTray = false;
+let hideTimer = null;
+let popoverReady = false;
+let pendingPopover = null;
+let lastAnchorEdge = 'bottom';   // 'top' means grow down; 'bottom' means grow up
+let capturedAnchorPoint = null;
+
+const STALE_MS = 24 * 60 * 60 * 1000; // 24 hours
+const DEFAULT_API_PORT = 3847;
+const POPOVER_WIDTH = 256;
+const POPOVER_PEEK_HEIGHT = 96;
+const POPOVER_EXPANDED_HEIGHT = 210;
+const POPOVER_INITIAL_HEIGHT = POPOVER_PEEK_HEIGHT;
+const POPOVER_MIN_HEIGHT = 80;
+const POPOVER_HIDE_GRACE_MS = 250;
+const POPOVER_ANCHOR_GAP = 6;
+const SUPPORTS_TRAY_HOVER = process.platform !== 'linux';
+
+// ─── MQTT (multi-company) ────────────────────────────────────────────────────
+// The broker carries one branch per monitoring server (projectId/systemId) with
+// a check per topic: `<projectId>/<systemId>/checks/<checkId>`. We subscribe to
+// all of them, parse each check's {available, latencyMs, packetLoss, ...}, group
+// the checks into companies (clients.json), and keep a per-company ping buffer.
+
+function setConnectionState(state) {
+  currentConnectionState = state;
+  broadcastConnectionState(state);
+  if (state === 'black') updateTray('black');
+}
+
+function slugify(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/\(from [^)]*\)/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'unknown';
+}
+
+// Which company tab a check belongs to. Explicit clients.json matches win;
+// otherwise the company is derived from the check label (one tab per check).
+function companyForCheck(label, id) {
+  const hay = `${id || ''} ${label || ''}`.toLowerCase();
+  for (const c of (clientsConfig.companies || [])) {
+    if (Array.isArray(c.match) && c.match.some((m) => hay.includes(String(m).toLowerCase()))) {
+      return { id: slugify(c.label), label: String(c.label) };
+    }
+  }
+  const derived = String(label || id || 'Unknown').replace(/\s*\(from [^)]*\)\s*/i, '').trim() || 'Unknown';
+  return { id: slugify(derived), label: derived };
+}
+
+// A raw check payload → a dashboard ping row. A check is binary up/down
+// (available); packet loss flags a degraded (amber) ping.
+function checkToPing(p) {
+  const status = p.available === false ? 'red' : (Number(p.packetLoss) > 0 ? 'yellow' : 'green');
+  const bits = [];
+  if (p.host) bits.push(p.host);
+  if (p.available === false) bits.push('unreachable');
+  else if (p.latencyMs != null) bits.push(`${p.latencyMs} ms`);
+  if (Number(p.packetLoss) > 0) bits.push(`${p.packetLoss}% loss`);
+  if (p.error) bits.push(String(p.error));
+  return {
+    // checks/ use checkedAt; connections/ use lastReceived.
+    checkedAt: p.checkedAt || p.lastReceived || new Date().toISOString(),
+    status,
+    // Numeric latency for the stat cards; null when unreachable so it's excluded
+    // from avg/min/max rather than counted as 0 ms.
+    latencyMs: (p.available !== false && p.latencyMs != null && p.latencyMs !== '') ? Number(p.latencyMs) : null,
+    // Packet loss % (responded pings only) and a 1/0 up flag for uptime %.
+    packetLossPct: (p.available !== false && p.packetLoss != null && p.packetLoss !== '') ? Number(p.packetLoss) : null,
+    up: status === 'red' ? 0 : 1,
+    machine: p.label || p.id || '',
+    checkId: p.id || '',
+    host: p.host || '',
+    detail: bits.join(' · '),
+  };
+}
+
+const MAX_PINGS_PER_COMPANY = 3000;
+
+function ingestCheck(payload, system) {
+  if (!payload || payload.available === undefined) return null;
+  const co = companyForCheck(payload.label, payload.id);
+  rememberCompany(co);
+  let entry = companies.get(co.id);
+  if (!entry) { entry = { id: co.id, label: co.label, pings: [], lastByCheck: new Map(), systems: new Set() }; companies.set(co.id, entry); }
+  // Record which monitoring agent(s) cover this company so liveness can be judged
+  // by the agent's heartbeat, not by one (possibly slow) check's timestamp.
+  if (system) entry.systems.add(system);
+  const ping = checkToPing(payload);
+  const prev = entry.lastByCheck.get(ping.checkId);
+  if (prev && prev.checkedAt === ping.checkedAt) return null; // retained re-delivery / duplicate
+  entry.lastByCheck.set(ping.checkId, ping);
+  entry.pings.push(ping);
+  if (entry.pings.length > MAX_PINGS_PER_COMPANY) entry.pings.splice(0, entry.pings.length - MAX_PINGS_PER_COMPANY);
+  if (ping.checkedAt) lastCheckedAt = ping.checkedAt;
+  // Bound lastByCheck: drop checks that haven't reported in a long time so a
+  // company churning through check IDs can't grow the map without limit (and
+  // long-dead checks don't linger in the "current" status). Gated on size so it's
+  // a no-op for the normal handful of checks.
+  if (entry.lastByCheck.size > 64) {
+    const staleBefore = Date.now() - STALE_MS;
+    for (const [k, p] of entry.lastByCheck) {
+      const t = Date.parse(p.checkedAt);
+      if (Number.isFinite(t) && t < staleBefore) entry.lastByCheck.delete(k);
+    }
+  }
+  savePingsSoon(); // debounced persist so history survives a restart
+  return { companyId: co.id, ping };
+}
+
+// A company is "online" only if one of its checks reported within this window;
+// retained-but-stale or never-seen-this-session companies read as offline.
+const ONLINE_MS = 5 * 60 * 1000;
+
+function rosterFile() {
+  return path.join(app.getPath('userData'), 'roster.json');
+}
+function loadRoster() {
+  try {
+    const data = JSON.parse(fs.readFileSync(rosterFile(), 'utf8'));
+    const m = new Map();
+    for (const c of (data.companies || [])) {
+      if (c && c.id) m.set(c.id, { id: c.id, label: c.label || c.id, lastSeen: c.lastSeen || 0 });
+    }
+    return m;
+  } catch { return new Map(); }
+}
+let rosterSaveTimer = null;
+function saveRosterSoon() {
+  if (rosterSaveTimer) return;
+  rosterSaveTimer = setTimeout(() => {
+    rosterSaveTimer = null;
+    try { fs.writeFileSync(rosterFile(), JSON.stringify({ companies: [...roster.values()] }, null, 2)); } catch {}
+  }, 2000);
+}
+function rememberCompany(co) {
+  const known = roster.get(co.id);
+  if (!known || known.label !== co.label) {
+    roster.set(co.id, { id: co.id, label: co.label, lastSeen: Date.now() });
+  } else {
+    known.lastSeen = Date.now();
+  }
+  saveRosterSoon();
+}
+
+// ── Ping persistence ──────────────────────────────────────────────────────────
+// entry.pings is the per-company ping history that drives the charts/tables and
+// the 4-in-a-row criticality. It lives only in memory, so without this it rebuilds
+// from scratch (empty) after every restart. Persist it to disk — debounced while
+// running, flushed synchronously on quit — and reload it on startup so history
+// survives a restart. Capped to the last PERSIST_WINDOW_MS (the window the UI
+// actually derives over) so the file stays small.
+const PERSIST_WINDOW_MS = 24 * 60 * 60 * 1000;
+function pingsCacheFile() {
+  return path.join(app.getPath('userData'), 'pings-cache.json');
+}
+function recentPings(pings) {
+  const cutoff = Date.now() - PERSIST_WINDOW_MS;
+  const kept = (pings || []).filter((p) => {
+    const t = Date.parse(p && p.checkedAt);
+    return Number.isFinite(t) && t > cutoff;
+  });
+  return kept.length > MAX_PINGS_PER_COMPANY ? kept.slice(kept.length - MAX_PINGS_PER_COMPANY) : kept;
+}
+function snapshotPings() {
+  const out = [];
+  for (const e of companies.values()) {
+    const pings = recentPings(e.pings);
+    if (pings.length) out.push({ id: e.id, label: e.label, pings });
+  }
+  return { savedAt: Date.now(), companies: out };
+}
+function loadPingsCache() {
+  let data;
+  try { data = JSON.parse(fs.readFileSync(pingsCacheFile(), 'utf8')); }
+  catch { return; }
+  if (!data || !Array.isArray(data.companies)) return;
+  for (const c of data.companies) {
+    if (!c || !c.id || !Array.isArray(c.pings)) continue;
+    const pings = recentPings(c.pings);
+    if (!pings.length) continue;
+    // Rebuild lastByCheck (newest ping per checkId) so ingestCheck's
+    // retained-re-delivery dedupe (it compares the last ping's checkedAt) works
+    // against the restored history and never double-counts a replay.
+    const lastByCheck = new Map();
+    for (const p of pings) { if (p && p.checkId) lastByCheck.set(p.checkId, p); }
+    companies.set(c.id, { id: c.id, label: c.label || c.id, pings, lastByCheck, systems: new Set() });
+  }
+}
+let pingsSaveTimer = null;
+function savePingsSoon() {
+  if (pingsSaveTimer) return;
+  pingsSaveTimer = setTimeout(() => {
+    pingsSaveTimer = null;
+    fs.promises.writeFile(pingsCacheFile(), JSON.stringify(snapshotPings())).catch(() => {});
+  }, 60000);
+}
+function flushPingsCache() {
+  if (pingsSaveTimer) { clearTimeout(pingsSaveTimer); pingsSaveTimer = null; }
+  try { fs.writeFileSync(pingsCacheFile(), JSON.stringify(snapshotPings())); } catch {}
+}
+
+// The vantage point a check pings FROM, parsed from its label "(from X)".
+// Checks without the suffix (e.g. local LAN checks) are each their own viewer.
+function viewerFromMachine(machine) {
+  const m = String(machine || '').match(/\(from ([^)]*)\)/i);
+  return (m && m[1].trim()) || String(machine || 'primary');
+}
+
+// Derive each minute's consensus level from a circuit's ping history: bucket by
+// minute, take each viewer's worst level that minute, then RED when >=50% of the
+// viewers are down, YELLOW for any down/degraded, else GREEN — the same derived
+// criticality the dashboard timeline shows. Returns levels oldest -> newest.
+function derivedMinuteLevels(pings) {
+  if (!pings || !pings.length) return [];
+  const latencies = pings.filter((p) => p.latencyMs != null).map((p) => p.latencyMs);
+  const avg = latencies.length ? latencies.reduce((s, v) => s + v, 0) / latencies.length : null;
+  const levelOf = (p) => p.status === 'red' ? 'red'
+    : (p.status === 'yellow' || (avg != null && p.latencyMs != null && p.latencyMs > Math.max(avg * 2.2 + 25, 40))) ? 'yellow'
+      : 'green';
+  const worse = { green: 0, yellow: 1, red: 2 };
+  const totalViewers = new Set(pings.map((p) => viewerFromMachine(p.machine))).size || 1;
+  const buckets = new Map(); // minuteMs -> Map<viewer, worstLevel>
+  for (const p of pings) {
+    const t = Date.parse(p.checkedAt);
+    if (!Number.isFinite(t)) continue;
+    const ms = Math.floor(t / 60000) * 60000;
+    let votes = buckets.get(ms);
+    if (!votes) { votes = new Map(); buckets.set(ms, votes); }
+    const v = viewerFromMachine(p.machine);
+    const lvl = levelOf(p);
+    const prev = votes.get(v);
+    if (prev == null || worse[lvl] > worse[prev]) votes.set(v, lvl);
+  }
+  return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([ms, votes]) => {
+    const vals = [...votes.values()];
+    const fails = vals.filter((x) => x === 'red').length;
+    const level = fails / totalViewers >= 0.5 ? 'red'
+      : (fails > 0 || vals.some((x) => x === 'yellow')) ? 'yellow' : 'green';
+    return { ms, level };
+  });
+}
+
+// Memoized per-company derivation. derivedMinuteLevels is O(pings); recomputing it
+// for every company on every 1.5s snapshot — and 3x per company in companies:pie —
+// was the main-thread hot path that decayed as buffers filled toward the 3000 cap.
+// Cache the result on the entry, keyed by (ping count + newest ping timestamp), so
+// it recomputes ONLY when that company gets a new ping; every reader (companyWorst,
+// the pie counts, the critical streak) then shares one derivation over the last 24h.
+function derivedFor(entry) {
+  const pings = entry.pings || [];
+  const lastTs = pings.length ? pings[pings.length - 1].checkedAt : '';
+  const cache = entry._derived;
+  if (cache && cache.len === pings.length && cache.lastTs === lastTs) return cache;
+  const windowed = recentPings(pings);
+  const levels = derivedMinuteLevels(windowed);
+  const viewers = new Set(windowed.map((p) => viewerFromMachine(p.machine))).size || 1;
+  const next = { len: pings.length, lastTs, levels, viewers };
+  entry._derived = next;
+  return next;
+}
+
+// Consecutive derived-down minute buckets at the END of the run. >= CRITICAL_DOWN_STREAK
+// is a confirmed, sustained outage — the single rule that reds the tray icon and
+// auto-highlights the pie slice. Operates on already-derived levels (cheap tail scan).
+const CRITICAL_DOWN_STREAK = 4;
+function trailingDownStreakFromLevels(levels) {
+  let streak = 0;
+  for (let i = levels.length - 1; i >= 0 && levels[i].level === 'red'; i--) streak += 1;
+  return streak;
+}
+
+// How many DISTINCT sustained-outage episodes occurred across the window — each
+// maximal run of >= CRITICAL_DOWN_STREAK consecutive derived-down buckets counts
+// once (the moment the run crosses the threshold is the icon going red once). This
+// feeds the pie's deep-red outer tier: a tally of "went critical" events.
+function countCriticalEpisodes(levels) {
+  let count = 0, run = 0;
+  for (const { level } of levels) {
+    if (level === 'red') { run += 1; if (run === CRITICAL_DOWN_STREAK) count += 1; }
+    else run = 0;
+  }
+  return count;
+}
+
+// A circuit watched from several vantage points ("viewers") is a redundancy
+// group: a single viewer reporting down usually means THAT viewer's path is
+// broken, not the target — so criticality is derived by >=50% quorum per minute.
+// RED is reserved for a SUSTAINED outage: >=4 consecutive derived-down minute
+// buckets (the current run). A shorter dip or any degraded viewer is AMBER, so a
+// single blip never reds the fleet; red means a confirmed, ongoing outage.
+function companyWorst(entry) {
+  const { levels } = derivedFor(entry);
+  if (trailingDownStreakFromLevels(levels) >= CRITICAL_DOWN_STREAK) return 'red';
+  const byViewer = new Map();
+  const worse = { green: 0, yellow: 1, red: 2 };
+  for (const ping of entry.lastByCheck.values()) {
+    const v = viewerFromMachine(ping.machine);
+    const cur = byViewer.get(v);
+    if (cur == null || worse[ping.status] > worse[cur]) byViewer.set(v, ping.status);
+  }
+  const statuses = [...byViewer.values()];
+  if (!statuses.length) return 'green';
+  // Not yet a confirmed outage — any current down or degraded viewer is amber.
+  if (statuses.some((s) => s === 'red' || s === 'yellow')) return 'yellow';
+  return 'green';
+}
+
+// ── Viewer source IPs ─────────────────────────────────────────────────────────
+// The connection check carries only the TARGET host, not each viewer's own IP.
+// But every viewer location (Vance, STL, Grayson, Biztech…) is itself a tracked
+// WAN circuit, so its IP is the host of that circuit. Build the lookup as
+// connection checks stream in.
+const connectionHostByToken = new Map(); // "vance" -> "207.242.49.34" (fiber preferred)
+const viewerAgent = new Map();           // "Eureka NOC" -> "<proj>/<sys>"
+const agentViewerNames = new Map();      // "<proj>/<sys>" -> Set("Eureka NOC","Biztech NOC")
+
+function locationToken(s) {
+  return String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)[0] || '';
+}
+function recordViewerLocation(payload, system) {
+  // Target circuit's location → its own host (the location's IP). Prefer a
+  // "fiber" circuit's host when a location has several circuits.
+  const circuit = String(payload.subjectLabel || payload.label || '').replace(/\s*\(from [^)]*\)\s*/i, '').trim();
+  const ctoken = locationToken(circuit);
+  if (ctoken && payload.host && (!connectionHostByToken.has(ctoken) || /fiber/i.test(circuit))) {
+    connectionHostByToken.set(ctoken, payload.host);
+  }
+  // The viewer (vantage) name + the agent that publishes it.
+  const m = String(payload.label || '').match(/\(from ([^)]*)\)/i);
+  const viewer = m && m[1].trim();
+  if (viewer && system) {
+    viewerAgent.set(viewer, system);
+    let names = agentViewerNames.get(system);
+    if (!names) { names = new Set(); agentViewerNames.set(system, names); }
+    names.add(viewer);
+  }
+}
+function viewerIp(name) {
+  const direct = connectionHostByToken.get(locationToken(name));
+  if (direct) return direct;
+  // The same agent can be labelled differently elsewhere (e.g. "Eureka NOC" is
+  // the same agent as "Biztech NOC") — try the agent's other location names.
+  const agent = viewerAgent.get(name);
+  if (agent) {
+    for (const alt of agentViewerNames.get(agent) || []) {
+      const ip = connectionHostByToken.get(locationToken(alt));
+      if (ip) return ip;
+    }
+  }
+  return '';
+}
+
+function companyOnline(entry) {
+  const now = Date.now();
+  // Online if any covering agent has reported (heartbeat or check) recently.
+  for (const sys of entry.systems || []) {
+    if (now - (systemActivity.get(sys) || 0) < ONLINE_MS) return true;
+  }
+  return false;
+}
+
+// The full roster (every company ever seen) merged with this session's live
+// data. Live companies report their real status; the rest read as offline.
+function companyList() {
+  const out = new Map();
+  for (const r of roster.values()) {
+    out.set(r.id, { id: r.id, label: r.label, status: 'offline', online: false, checks: 0 });
+  }
+  for (const e of companies.values()) {
+    const online = companyOnline(e);
+    const lastPing = e.pings.length ? e.pings[e.pings.length - 1] : null;
+    out.set(e.id, {
+      id: e.id,
+      label: e.label,
+      status: online ? companyWorst(e) : 'offline',
+      online,
+      checks: e.lastByCheck.size,
+      host: (lastPing && lastPing.host) || '', // target IP, for search-by-IP
+    });
+  }
+  // Live clients first (left), offline clients last (right); alphabetical within each.
+  return [...out.values()].sort((a, b) =>
+    (Number(b.online) - Number(a.online)) || a.label.localeCompare(b.label));
+}
+
+// Aggregate health across the whole fleet — drives the tray icon, tooltip,
+// right-click menu, and popover.
+function overallSnapshot() {
+  const list = companyList();
+  const down = list.filter((c) => c.online && c.status === 'red').map((c) => c.label);
+  const degraded = list.filter((c) => c.online && c.status === 'yellow').map((c) => c.label);
+  const offline = list.filter((c) => !c.online).map((c) => c.label);
+  // Red if a client is down; amber if a client is degraded OR we've lost
+  // monitoring on one (offline); green only when everything is live and healthy.
+  const status = down.length ? 'red' : (degraded.length || offline.length) ? 'yellow' : 'green';
+  let detail;
+  if (!list.length) {
+    detail = 'Waiting for data…';
+  } else if (status === 'green') {
+    detail = `All ${list.length} clients healthy`;
+  } else {
+    const parts = [];
+    if (down.length) parts.push(`${down.length} down`);
+    if (degraded.length) parts.push(`${degraded.length} degraded`);
+    if (offline.length) parts.push(`${offline.length} offline`);
+    detail = parts.join(' · ');
+  }
+  return { status, detail, down, degraded, offline, live: list.length - offline.length, total: list.length, checkedAt: lastCheckedAt };
+}
+
+function statusSnapshot() {
+  return { status: currentStatus || overallSnapshot(), connectionState: currentConnectionState };
+}
+
+// The synthetic "system" (agent) the ESET poller publishes under, so the same
+// online/offline liveness logic that MQTT heartbeats fed continues to work.
+const ESET_SYSTEM = 'eset/connect';
+
+// One ESET detection → the exact "check" payload shape the MQTT message handler
+// produced. A device with an unresolved detection reads as down (red); a resolved
+// one reads as up (green). The detection's device is the "company" (it drives the
+// same companyForCheck grouping). Each poll re-states the current detection status
+// as of now, mirroring the periodic check cadence MQTT delivered.
+function detectionToCheck(d, checkedAt) {
+  const device = d.device || {};
+  const host = device.displayName || device.hostname || d.deviceName || 'Unknown device';
+  const threat = d.displayName || d.detectionName || d.typeName || d.objectTypeName || 'Detection';
+  return {
+    available: d.resolved === true,
+    id: d.uuid || d.id || `${host}:${threat}`,
+    label: host,
+    host,
+    error: d.resolved === true ? '' : threat,
+    checkedAt,
+  };
+}
+
+async function pollEset() {
+  const polledAt = new Date();
+  const checkedAt = polledAt.toISOString();
+  const lookbackMs = Math.max(1, Number(settings.lookbackHours) || 24) * 60 * 60 * 1000;
+  const startTime = new Date(polledAt.getTime() - lookbackMs).toISOString();
+
+  let detections;
+  try {
+    detections = await fetchDetections(settings, startTime, checkedAt);
+  } catch (err) {
+    console.error('[ESET] poll failed:', err.message);
+    setConnectionState('black');
+    return;
+  }
+
+  // The poller is the live agent — mark it active so its company stays online.
+  systemActivity.set(ESET_SYSTEM, polledAt.getTime());
+  for (const d of detections) {
+    const res = ingestCheck(detectionToCheck(d, checkedAt), ESET_SYSTEM);
+    if (res) broadcastCheck(res.companyId, res.ping);
+  }
+
+  setConnectionState('live');
+  currentStatus = overallSnapshot();
+  updateTray(currentStatus.status);
+  broadcastToRenderer(currentStatus);
+}
+
+function startEsetSource() {
+  if (esetTimer) { clearInterval(esetTimer); esetTimer = null; }
+
+  currentConnectionState = 'grey';
+  broadcastConnectionState('grey');
+  updateTray('grey');
+
+  // No credentials yet — stay grey until the user configures the ESET API.
+  if (!settings.esetUsername || !settings.esetPassword) return;
+
+  const intervalMs = Math.max(10, Number(settings.pollIntervalSec) || 60) * 1000;
+  pollEset();
+  esetTimer = setInterval(pollEset, intervalMs);
+}
+
+// ─── Staleness interval ───────────────────────────────────────────────────────
+
+// Runs every minute to catch the case where MQTT is connected but the API
+// stopped publishing (no new messages for 24h).
+function startStalenessCheck() {
+  setInterval(() => {
+    if (currentConnectionState === 'black') return;
+    if (!lastCheckedAt) return;
+    const age = Date.now() - new Date(lastCheckedAt).getTime();
+    if (age > STALE_MS) {
+      console.log('[STALENESS] No update in 24h — going black');
+      setConnectionState('black');
+    }
+  }, 60_000);
+}
+
+// ─── Tray ─────────────────────────────────────────────────────────────────────
+
+function statusLabel(s) {
+  const labels = {
+    green: 'All healthy', yellow: 'Attention needed',
+    red: 'Client down', grey: 'Connecting…', black: 'No updates',
+  };
+  return labels[s] || 'Unknown';
+}
+
+function buildContextMenu() {
+  const items = [{ label: 'Status Monitor', enabled: false }];
+  const snap = (auth.currentUser() && currentConnectionState === 'live') ? overallSnapshot() : null;
+  if (!snap) {
+    items.push({ label: `Status: ${statusLabel(currentConnectionState)}`, enabled: false });
+  } else {
+    items.push({ label: snap.detail, enabled: false });
+    // Name the clients that need attention so the menu tells the whole story.
+    const addNames = (prefix, names) => {
+      if (!names.length) return;
+      items.push({ type: 'separator' });
+      for (const n of names.slice(0, 8)) items.push({ label: `   ${prefix} ${n}`, enabled: false });
+      if (names.length > 8) items.push({ label: `   …and ${names.length - 8} more`, enabled: false });
+    };
+    addNames('✕', snap.down);       // down
+    addNames('▲', snap.degraded);   // degraded
+    addNames('○', snap.offline);    // offline (lost monitoring)
+  }
+  items.push(
+    { type: 'separator' },
+    { label: 'Open Details', click: () => showExpandedWindow(true) },
+    { type: 'separator' },
+    { label: 'Quit', click: () => app.quit() },
+  );
+  return Menu.buildFromTemplate(items);
+}
+
+let lastTrayStatus = 'grey';
+function updateTray(status) {
+  if (!tray) return;
+  lastTrayStatus = status;
+  // No status is revealed until someone is signed in — the tray icon stays
+  // neutral grey while signed out.
+  const signedIn = !!auth.currentUser();
+  const effective = signedIn ? status : 'grey';
+  tray.setImage(icons[effective] || icons.grey);
+  // No OS tooltip at all on the tray icon (hovering opens the popover instead).
+  tray.setToolTip('');
+}
+
+// ─── Main window ──────────────────────────────────────────────────────────────
+
+function createWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) return mainWindow;
+
+  // Base options shared across platforms.
+  const opts = {
+    width: POPOVER_WIDTH,
+    height: POPOVER_INITIAL_HEIGHT,
+    resizable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    show: false,
+    frame: false,            // frameless — no OS title bar / chrome
+    transparent: true,       // per-pixel transparency — only the CSS .panel paints
+    backgroundColor: '#00000000', // fully transparent base (no opaque window fill)
+    roundedCorners: true,    // honored on macOS; Win11 rounds frameless windows automatically
+    // hasShadow MUST be false on a transparent frameless window: on Windows the DWM
+    // shadow is drawn around the window's full RECTANGLE (it ignores the CSS
+    // border-radius), which shows up as the grey rectangle behind the rounded panel.
+    hasShadow: false,
+    thickFrame: false,       // no native resize/frame surface that could paint a rect
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  };
+
+  if (process.platform === 'darwin') {
+    // macOS native vibrancy. macOS clips vibrancy to the window's rounded shape,
+    // so no rectangular backdrop leaks out behind the corners.
+    opts.vibrancy = 'under-window';
+    opts.visualEffectState = 'active';
+  } else if (process.platform === 'win32') {
+    // Windows 11: real OS acrylic so DWM blurs the desktop / other app windows
+    // BEHIND the popover. backgroundMaterial requires a NON-transparent window,
+    // so transparent is flipped off; backgroundColor #00000000 = pure acrylic
+    // with no fill, and the .panel paints the widget-well tint on top. DWM rounds
+    // the frameless window at its native radius (the .panel is squared to match
+    // under body.win-acrylic so no corner leaks).
+    opts.transparent = false;
+    opts.backgroundColor = '#00000000';
+    opts.backgroundMaterial = 'acrylic';
+    // DWM backdrop effects (acrylic/mica) need the window to keep WS_THICKFRAME —
+    // a frameless window with thickFrame:false won't render the acrylic at all.
+    opts.thickFrame = true;
+  } else {
+    // Linux / other: stay transparent too. An opaque window backgroundColor
+    // ('#141414') was the grey rectangle here — the .panel's CSS rgba fill is
+    // the only surface. Compositing-less WMs degrade to the panel rgba, which is
+    // still acceptable; no window-level opaque rectangle is ever drawn.
+  }
+
+  mainWindow = new BrowserWindow(opts);
+  if (process.platform === 'win32' && typeof mainWindow.setBackgroundMaterial === 'function') {
+    // Some Electron builds only apply acrylic when set after construction.
+    try { mainWindow.setBackgroundMaterial('acrylic'); } catch { /* older Electron: no-op */ }
+  }
+  mainWindow.setAlwaysOnTop(true, 'screen-saver');
+  mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  mainWindow.setIgnoreMouseEvents(false);
+  mainWindow.setContentSize(POPOVER_WIDTH, POPOVER_PEEK_HEIGHT);
+
+  if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
+    mainWindow.loadURL(MAIN_WINDOW_VITE_DEV_SERVER_URL);
+  } else {
+    mainWindow.loadFile(
+      path.join(__dirname, `../renderer/${MAIN_WINDOW_VITE_NAME}/index.html`)
+    );
+  }
+
+  mainWindow.on('close', (e) => {
+    if (isQuitting) return;
+    e.preventDefault();
+    hidePopover();
+  });
+
+  mainWindow.on('blur', () => {
+    if (mainWindow.webContents.isDevToolsOpened()) return;
+    if (popoverPinned) {
+      hidePopover();
+      return;
+    }
+    if (!popoverPinned && !pointerInPopover && !pointerInTray) schedulePeekHide();
+  });
+
+  mainWindow.on('hide', () => {
+    resetToHoverBaseline();
+  });
+
+  mainWindow.webContents.once('did-finish-load', () => {
+    sendPopoverMode();
+  });
+
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.setContentSize(POPOVER_WIDTH, POPOVER_PEEK_HEIGHT);
+    positionWindow();
+  });
+
+  return mainWindow;
+}
+
+function cancelHideTimer() {
+  if (!hideTimer) return;
+  clearTimeout(hideTimer);
+  hideTimer = null;
+}
+
+function resetToHoverBaseline() {
+  cancelHideTimer();
+  popoverPinned = false;
+  pointerInPopover = false;
+  pointerInTray = false;
+  pendingPopover = null;
+  capturedAnchorPoint = null;
+  popoverMode = 'peek';
+  lastAnchorEdge = 'bottom';
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setIgnoreMouseEvents(false);
+    // Only reposition while VISIBLE. Repositioning a HIDDEN window here — with the
+    // anchor just cleared above — re-anchors it to the live cursor (which is now far
+    // from the tray, so capturePopoverAnchor falls back to the cursor). A later show
+    // then made the window flash at the cursor instead of by the tray icon.
+    if (mainWindow.isVisible()) applyPopoverBounds(POPOVER_PEEK_HEIGHT, false);
+    sendAnchorEdge();
+    sendPopoverMode();
+  }
+}
+
+function hidePopover() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.hide();
+  }
+  resetToHoverBaseline();
+}
+
+function schedulePeekHide() {
+  cancelHideTimer();
+  hideTimer = setTimeout(() => {
+    hideTimer = null;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (isCursorInPopover()) return;
+    if (popoverPinned || pointerInPopover || pointerInTray) return;
+    hidePopover();
+  }, POPOVER_HIDE_GRACE_MS);
+}
+
+function sendPopoverMode() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('window:mode', popoverMode);
+}
+
+function sendAnchorEdge() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('window:anchor-edge', lastAnchorEdge);
+}
+
+function targetHeightForMode(mode) {
+  return mode === 'expanded' ? POPOVER_EXPANDED_HEIGHT : POPOVER_PEEK_HEIGHT;
+}
+
+function boundsForHeight(height, pinned = popoverPinned) {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  const current = mainWindow.getBounds();
+  const width = POPOVER_WIDTH;
+
+  if (pinned) {
+    const display = screen.getDisplayMatching(current);
+    const workArea = display.workArea;
+    const x = Math.round(Math.min(
+      Math.max(current.x, workArea.x),
+      workArea.x + workArea.width - width
+    ));
+    const y = lastAnchorEdge === 'bottom'
+      ? current.y + current.height - height
+      : current.y;
+    const clampedY = Math.round(Math.min(
+      Math.max(y, workArea.y),
+      workArea.y + workArea.height - height
+    ));
+    return { x, y: clampedY, width, height };
+  }
+
+  return boundsForTrayAnchor(height);
+}
+
+function applyPopoverBounds(targetHeight, pinned = popoverPinned) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const bounds = boundsForHeight(targetHeight, pinned);
+  if (bounds) mainWindow.setBounds(bounds);
+}
+
+function applyPopoverSize(mode) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  applyPopoverBounds(targetHeightForMode(mode));
+}
+
+function setPopoverMode(mode) {
+  popoverMode = mode;
+  applyPopoverSize(mode);
+  sendAnchorEdge();
+  sendPopoverMode();
+}
+
+function pinPopover() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  cancelHideTimer();
+  pendingPopover = null;
+  pointerInPopover = true;
+  popoverPinned = true;
+  mainWindow.setIgnoreMouseEvents(false);
+  if (popoverMode === 'peek') setPopoverMode('expanded');
+  if (!mainWindow.isVisible()) mainWindow.show();
+  mainWindow.focus();
+}
+
+function trayBoundsAreUsable(trayBounds, cursorPoint) {
+  if (!trayBounds || trayBounds.width <= 2 || trayBounds.height <= 2) return false;
+  const trayCenter = {
+    x: trayBounds.x + trayBounds.width / 2,
+    y: trayBounds.y + trayBounds.height / 2,
+  };
+  const distance = Math.hypot(trayCenter.x - cursorPoint.x, trayCenter.y - cursorPoint.y);
+  return distance <= 180;
+}
+
+function capturePopoverAnchor() {
+  // Once the popover is open with an anchor, keep it FIXED for the whole visible
+  // session — any stray re-anchor (e.g. a resize-driven reposition reading the
+  // live cursor) would make the window trail the mouse. The anchor is cleared on
+  // hide (resetToHoverBaseline), so the next open captures fresh.
+  if (capturedAnchorPoint && mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
+    return capturedAnchorPoint;
+  }
+  const trayBounds = tray.getBounds();
+  const cursorPoint = screen.getCursorScreenPoint();
+  const hasUsableTrayBounds = trayBoundsAreUsable(trayBounds, cursorPoint);
+  capturedAnchorPoint = hasUsableTrayBounds
+    ? {
+        x: trayBounds.x + trayBounds.width / 2,
+        y: trayBounds.y,
+      }
+    : cursorPoint;
+  return capturedAnchorPoint;
+}
+
+function popoverAnchor() {
+  const anchorPoint = capturedAnchorPoint || capturePopoverAnchor();
+  const display = screen.getDisplayNearestPoint(anchorPoint);
+  return { anchorPoint, display };
+}
+
+function isCursorInPopover(padding = 8) {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  const cursor = screen.getCursorScreenPoint();
+  const bounds = mainWindow.getBounds();
+  return cursor.x >= bounds.x - padding
+    && cursor.x <= bounds.x + bounds.width + padding
+    && cursor.y >= bounds.y - padding
+    && cursor.y <= bounds.y + bounds.height + padding;
+}
+
+function maxPopoverHeight() {
+  const { display } = popoverAnchor();
+  return Math.max(POPOVER_MIN_HEIGHT, display.workArea.height - 4);
+}
+
+function boundsForTrayAnchor(height = null) {
+  if (!tray || !mainWindow || mainWindow.isDestroyed()) return;
+
+  const windowBounds = mainWindow.getBounds();
+  const { anchorPoint, display } = popoverAnchor();
+  const workArea = display.workArea;
+  const width = POPOVER_WIDTH;
+  const targetHeight = height ?? windowBounds.height;
+  let x = anchorPoint.x - width / 2;
+  let y = anchorPoint.y - targetHeight - POPOVER_ANCHOR_GAP;
+  const anchorNearTop = anchorPoint.y < workArea.y + workArea.height / 2;
+
+  if (anchorNearTop) {
+    lastAnchorEdge = 'top';
+    y = anchorPoint.y + POPOVER_ANCHOR_GAP;
+  } else {
+    lastAnchorEdge = 'bottom';
+  }
+
+  x = Math.round(Math.min(Math.max(x, workArea.x), workArea.x + workArea.width - width));
+  y = Math.round(Math.min(Math.max(y, workArea.y), workArea.y + workArea.height - targetHeight));
+
+  return { x, y, width, height: targetHeight };
+}
+
+function positionWindow() {
+  const bounds = boundsForTrayAnchor();
+  if (bounds) mainWindow.setBounds(bounds);
+}
+
+function showPopover(mode, focus, pinned = false) {
+  if (!mainWindow) createWindow();
+
+  cancelHideTimer();
+  if (!mainWindow.isVisible() && !pinned) {
+    popoverPinned = false;
+    pointerInPopover = false;
+    pendingPopover = null;
+    capturePopoverAnchor();
+  }
+  const wasVisible = mainWindow.isVisible();
+  popoverPinned = pinned && wasVisible;
+  setPopoverMode(mode);
+  popoverPinned = pinned;
+  positionWindow();
+
+  if (!popoverReady) {
+    pendingPopover = { mode, focus, pinned };
+    return;
+  }
+
+  if (focus) {
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
+    mainWindow.show();
+    mainWindow.moveTop();
+    mainWindow.focus();
+  } else {
+    mainWindow.setIgnoreMouseEvents(false);
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
+    mainWindow.showInactive();
+    mainWindow.moveTop();
+  }
+}
+
+function flushPendingPopover() {
+  if (!pendingPopover || !mainWindow || mainWindow.isDestroyed()) return;
+  const { mode, focus, pinned } = pendingPopover;
+  pendingPopover = null;
+  popoverPinned = pinned;
+  setPopoverMode(mode);
+  positionWindow();
+  if (focus) {
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
+    mainWindow.show();
+    mainWindow.moveTop();
+    mainWindow.focus();
+  } else {
+    mainWindow.setIgnoreMouseEvents(false);
+    mainWindow.setAlwaysOnTop(true, 'screen-saver');
+    mainWindow.showInactive();
+    mainWindow.moveTop();
+  }
+}
+
+function showPeekWindow() {
+  pointerInPopover = false;
+  popoverPinned = false;
+  capturePopoverAnchor();
+  showPopover('peek', false, false);
+}
+
+function showExpandedWindow(pinned = false) {
+  pointerInPopover = false;
+  // Always focus (2nd arg) so Windows renders the OS acrylic backdrop — an
+  // unfocused window (showInactive) falls back to a flat, non-blurred fill, which
+  // is why hover used to look non-acrylic. `pinned` still controls whether the
+  // popover stays open after the pointer leaves the tray/popover.
+  showPopover('expanded', true, pinned);
+}
+
+// ─── Dashboard window ───────────────────────────────────────────────────────
+
+function dashboardIndexPath() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, 'dashboard', 'index.html');
+  }
+
+  const candidates = [
+    path.join(app.getAppPath(), 'dashboard', 'index.html'),
+    path.join(process.cwd(), 'dashboard', 'index.html'),
+    path.join(__dirname, '..', '..', 'dashboard', 'index.html'),
+  ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+}
+
+// The dashboard markup (dashboard/index.html) is the canonical default layout —
+// a brand-new account just renders it. This used to seed a saved "Baxley"
+// snapshot from default-layout.json, which kept resurrecting the old layout
+// (gauge + count cards) over the current default, so seeding is disabled.
+function seedDefaultLayoutForUser() {}
+
+function createDashboardWindow() {
+  if (dashboardWindow && !dashboardWindow.isDestroyed()) {
+    dashboardWindow.show();
+    dashboardWindow.focus();
+    return dashboardWindow;
+  }
+
+  // The dashboard renderer draws its own window chrome (drag region +
+  // minimize/close/reload glass controls), so the window is frameless.
+  // sandbox:false lets dashboard-preload.js use node:fs for the synchronous
+  // layout persistence bridge the dashboard builder requires.
+  dashboardWindow = new BrowserWindow({
+    width: 1440,
+    height: 1000,
+    minWidth: 1024,
+    minHeight: 720,
+    show: false,
+    frame: false,
+    autoHideMenuBar: true,
+    backgroundColor: '#f7f8fb',
+    webPreferences: {
+      preload: path.join(__dirname, 'dashboard-preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false,
+    },
+  });
+
+  seedDefaultLayoutForUser(auth.currentUser());
+  dashboardWindow.loadFile(dashboardIndexPath());
+
+  dashboardWindow.once('ready-to-show', () => {
+    if (!dashboardWindow || dashboardWindow.isDestroyed()) return;
+    dashboardWindow.show();
+    dashboardWindow.focus();
+  });
+
+  dashboardWindow.webContents.once('did-finish-load', () => {
+    if (!dashboardWindow || dashboardWindow.isDestroyed()) return;
+    dashboardWindow.webContents.send('mqtt:connection', currentConnectionState);
+    if (currentStatus) dashboardWindow.webContents.send('mqtt:status', currentStatus);
+  });
+
+  dashboardWindow.on('closed', () => {
+    dashboardWindow = null;
+  });
+
+  return dashboardWindow;
+}
+
+function openDashboardWindow() {
+  const window = createDashboardWindow();
+  if (window.isMinimized()) window.restore();
+  window.show();
+  window.focus();
+}
+
+function openRendererWindows() {
+  return [mainWindow, dashboardWindow].filter((win) => win && !win.isDestroyed());
+}
+
+function broadcastToRenderer(payload) {
+  openRendererWindows().forEach((win) => win.webContents.send('mqtt:status', payload));
+}
+
+function broadcastConnectionState(state) {
+  openRendererWindows().forEach((win) => win.webContents.send('mqtt:connection', state));
+}
+
+// A single new ping for one company → the dashboard (which buffers per company).
+function broadcastCheck(companyId, ping) {
+  if (dashboardWindow && !dashboardWindow.isDestroyed()) {
+    dashboardWindow.webContents.send('mqtt:check', { companyId, ping });
+  }
+}
+
+// ─── Notifications ────────────────────────────────────────────────────────────
+
+function sendNotification(payload) {
+  if (!Notification.isSupported()) return;
+  const titles = { green: 'Status OK', yellow: 'Status Warning', red: 'Status Error' };
+  new Notification({
+    title: titles[payload.status] || 'Status Changed',
+    body: payload.detail || '',
+    urgency: payload.status === 'red' ? 'critical' : 'normal',
+  }).show();
+}
+
+// ─── App lifecycle ────────────────────────────────────────────────────────────
+
+app.whenReady().then(() => {
+  if (app.dock) app.dock.hide();
+
+  roster = loadRoster();
+  loadPingsCache(); // restore per-company ping history before live data resumes
+  auth.init();
+
+  tray = new Tray(icons.grey);
+  updateTray('grey');
+  createWindow();
+
+  // The dashboard is the primary surface: open it on launch so users sign in
+  // and land on it by default (the tray popover remains available).
+  openDashboardWindow();
+
+  // LEFT click toggles the popover near the tray icon.
+  tray.on('click', () => {
+    if (mainWindow && mainWindow.isVisible() && popoverPinned) {
+      hidePopover();
+    } else {
+      showExpandedWindow(true);
+    }
+  });
+
+  if (SUPPORTS_TRAY_HOVER) {
+    // macOS and Windows expose tray hover. Windows can be unreliable when the
+    // icon lives in the overflow flyout instead of the visible taskbar.
+    tray.on('mouse-enter', () => {
+      pointerInTray = true;
+      // Windows fires mouse-enter repeatedly as the cursor moves over the icon.
+      // Only OPEN (and anchor) the popover when it isn't already showing — re-
+      // showing on every event re-ran positionWindow, so the window trailed the
+      // cursor before the hide grace elapsed. While it's already open we just
+      // keep it open (cancel any pending hide) without re-anchoring it.
+      cancelHideTimer();
+      if (!mainWindow || !mainWindow.isVisible()) {
+        showExpandedWindow(false);
+      }
+    });
+
+    tray.on('mouse-leave', () => {
+      pointerInTray = false;
+      if (!popoverPinned && !pointerInPopover) schedulePeekHide();
+    });
+  }
+
+  // RIGHT click shows the status breakdown + show/quit menu.
+  tray.on('right-click', () => {
+    tray.popUpContextMenu(buildContextMenu());
+  });
+
+  startStalenessCheck();
+  startEsetSource();
+});
+
+app.on('before-quit', () => { isQuitting = true; flushPingsCache(); });
+
+app.on('window-all-closed', () => {});
+
+app.on('will-quit', () => {
+  if (esetTimer) clearInterval(esetTimer);
+});
+
+// ─── IPC handlers ─────────────────────────────────────────────────────────────
+
+ipcMain.handle('status:get', () => statusSnapshot());
+
+// Multi-company API for the dashboard tabs.
+ipcMain.handle('companies:get', () => companyList());
+
+// viewer name → its source IP (derived from each location's own circuit).
+ipcMain.handle('viewers:ips', () => {
+  const out = {};
+  for (const name of viewerAgent.keys()) {
+    const ip = viewerIp(name);
+    if (ip) out[name] = ip;
+  }
+  return out;
+});
+
+ipcMain.handle('company:history', (_e, payload = {}) => {
+  const entry = companies.get(payload.companyId);
+  if (!entry) return { ok: true, results: [] };
+  const n = Math.min(Math.max(Number(payload.limit) || 2000, 1), 5000);
+  return { ok: true, results: entry.pings.slice(-n) };
+});
+
+ipcMain.handle('settings:get', () => settings);
+
+ipcMain.handle('settings:save', (_e, newSettings) => {
+  settings = { ...settings, ...newSettings };
+  saveSettings(settings);
+  startEsetSource();
+  return { ok: true };
+});
+
+ipcMain.handle('shell:openExternal', (_e, url) => {
+  // Only hand http(s) URLs to the OS — never file:, javascript:, or other
+  // schemes a malformed/unexpected value could carry.
+  try {
+    const parsed = new URL(String(url));
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return shell.openExternal(parsed.href);
+    }
+  } catch {}
+  return undefined;
+});
+
+ipcMain.handle('window:resize-content', (e, size = {}) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
+  if (e.sender !== mainWindow.webContents) return { ok: false };
+
+  const parsedHeight = Number.parseInt(size.height, 10);
+  const measuredHeight = Number.isFinite(parsedHeight)
+    ? parsedHeight
+    : targetHeightForMode(popoverMode);
+  // Size the expanded window to its MEASURED content — do NOT floor it at the
+  // donut's height. Shorter views (profile/settings) used to be forced to the
+  // full expanded height, and since the panel is bottom-anchored that left an
+  // empty strip above them — now visible as bare acrylic (it was transparent
+  // before the OS-acrylic window). The donut's content already exceeds the floor,
+  // so it is unaffected.
+  const height = popoverMode === 'peek'
+    ? POPOVER_PEEK_HEIGHT
+    : Math.min(Math.max(measuredHeight, POPOVER_MIN_HEIGHT), maxPopoverHeight());
+
+  // Don't reposition a hidden window: the renderer's ResizeObserver keeps firing
+  // while hidden (status ticks, view reset), and re-anchoring then snaps the window
+  // to the far-away cursor — which is what made it flash at the cursor on a later
+  // desktop click. Resize in place only when visible.
+  if (mainWindow.isVisible()) applyPopoverBounds(height, popoverPinned);
+  return { ok: true, width: POPOVER_WIDTH, height };
+});
+
+ipcMain.handle('window:renderer-ready', (e) => {
+  if (!mainWindow || mainWindow.isDestroyed() || e.sender !== mainWindow.webContents) {
+    return { ok: false };
+  }
+  popoverReady = true;
+  applyPopoverSize(popoverMode);
+  flushPendingPopover();
+  return { ok: true };
+});
+
+ipcMain.handle('window:pin', (e) => {
+  if (!mainWindow || mainWindow.isDestroyed() || e.sender !== mainWindow.webContents) {
+    return { ok: false };
+  }
+  pinPopover();
+  return { ok: true };
+});
+
+ipcMain.handle('window:refresh-status', (e) => {
+  if (!mainWindow || mainWindow.isDestroyed() || e.sender !== mainWindow.webContents) {
+    return { ok: false };
+  }
+  startEsetSource();
+  if (currentStatus) mainWindow.webContents.send('mqtt:status', currentStatus);
+  mainWindow.webContents.send('mqtt:connection', currentConnectionState);
+  return { ok: true, ...statusSnapshot() };
+});
+
+ipcMain.handle('window:hide-popover', (e) => {
+  if (!mainWindow || mainWindow.isDestroyed() || e.sender !== mainWindow.webContents) {
+    return { ok: false };
+  }
+  hidePopover();
+  return { ok: true };
+});
+
+ipcMain.handle('window:pointer-enter', (e) => {
+  if (!mainWindow || mainWindow.isDestroyed() || e.sender !== mainWindow.webContents) {
+    return { ok: false };
+  }
+  pointerInPopover = true;
+  cancelHideTimer();
+  mainWindow.setIgnoreMouseEvents(false);
+  if (!popoverPinned && popoverMode === 'peek') {
+    setPopoverMode('expanded');
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('window:pointer-leave', (e) => {
+  if (!mainWindow || mainWindow.isDestroyed() || e.sender !== mainWindow.webContents) {
+    return { ok: false };
+  }
+  pointerInPopover = false;
+  if (!popoverPinned && !pointerInTray) schedulePeekHide();
+  return { ok: true };
+});
+
+// ─── Dashboard background environment (for the popover's WebGL glass) ────────
+// Tone presets and photo sources mirror dashboard/app/static (index.html boot
+// script and modules/background-controller.js). The dashboard mirrors its
+// localStorage background choice into the shared layout store
+// (~/.status-monitor/dashboard-layout-store.json) so it is readable here.
+
+const BACKGROUND_TONE_PRESETS = {
+  'tone-light-grey': '#d1d5db',
+  'tone-grey': '#6b7280',
+  'tone-dark-grey': '#1f2937',
+  'tone-black': '#000000',
+};
+
+const BACKGROUND_PHOTO_SOURCES = {
+  'photo-bark': 'app/static/backgrounds/nature/bark.webp',
+  'photo-cloud': 'app/static/backgrounds/nature/cloud.webp',
+  'photo-jungle': 'app/static/backgrounds/nature/jungle.webp',
+  'photo-moss': 'app/static/backgrounds/nature/moss.webp',
+  'photo-sand': 'app/static/backgrounds/nature/sand.webp',
+  'photo-shore': 'app/static/backgrounds/nature/shore.webp',
+  'photo-turf': 'app/static/backgrounds/nature/turf.webp',
+  'photo-water': 'app/static/backgrounds/nature/water.webp',
+  'photo-water2': 'app/static/backgrounds/nature/water2.webp',
+  'photo-denim': 'app/static/backgrounds/textures/denim.webp',
+  'photo-marble': 'app/static/backgrounds/textures/marble.webp',
+  'photo-leather': 'app/static/backgrounds/textures/leather.webp',
+  'photo-texture': 'app/static/backgrounds/textures/texture.webp',
+  'photo-paint': 'app/static/backgrounds/abstract/paint.webp',
+  'photo-paintspill': 'app/static/backgrounds/abstract/paintspill.webp',
+  'photo-city': 'app/static/backgrounds/urban/city.webp',
+  'photo-modern': 'app/static/backgrounds/urban/modern.webp',
+  'photo-mercury': 'app/static/backgrounds/space/mercury.webp',
+  'photo-venus': 'app/static/backgrounds/space/venus.webp',
+  'photo-earth': 'app/static/backgrounds/space/earth.webp',
+  'photo-mars': 'app/static/backgrounds/space/mars.webp',
+  'photo-jupiter': 'app/static/backgrounds/space/jupiter.webp',
+  'photo-saturn': 'app/static/backgrounds/space/saturn.webp',
+  'photo-uranus': 'app/static/backgrounds/space/uranus.webp',
+  'photo-neptune': 'app/static/backgrounds/space/neptune.webp',
+  'photo-pluto': 'app/static/backgrounds/space/pluto.webp',
+};
+
+const DASHBOARD_LAYOUT_STORE = path.join(os.homedir(), '.status-monitor', 'dashboard-layout-store.json');
+
+// Photo backgrounds are read once and memoized — the popover re-requests the
+// backdrop on every show, and the bundled photos never change at runtime.
+const photoDataUrlCache = new Map();
+
+function savedDashboardBackground() {
+  try {
+    const store = JSON.parse(fs.readFileSync(DASHBOARD_LAYOUT_STORE, 'utf8'));
+    const value = store['dashboard-background'];
+    return typeof value === 'string' && value.trim() ? value.trim() : 'tone-dark-grey';
+  } catch {
+    return 'tone-dark-grey';
+  }
+}
+
+ipcMain.handle('dashboard:background', () => {
+  const key = savedDashboardBackground();
+  const fallbackTone = BACKGROUND_TONE_PRESETS['tone-dark-grey'];
+  const result = { key, bgStart: fallbackTone, bgEnd: fallbackTone, photoDataUrl: '' };
+
+  if (BACKGROUND_TONE_PRESETS[key]) {
+    result.bgStart = result.bgEnd = BACKGROUND_TONE_PRESETS[key];
+    return result;
+  }
+  if (/^#[0-9a-f]{6}$/i.test(key)) {
+    // Derived custom-color backgrounds serialize as a bare hex tone.
+    result.bgStart = result.bgEnd = key;
+    return result;
+  }
+  const photoSource = BACKGROUND_PHOTO_SOURCES[key];
+  if (photoSource) {
+    if (photoDataUrlCache.has(key)) {
+      result.photoDataUrl = photoDataUrlCache.get(key);
+    } else {
+      try {
+        const photoPath = path.join(path.dirname(dashboardIndexPath()), photoSource);
+        const dataUrl = `data:image/webp;base64,${fs.readFileSync(photoPath).toString('base64')}`;
+        photoDataUrlCache.set(key, dataUrl);
+        result.photoDataUrl = dataUrl;
+      } catch (err) {
+        console.warn('[dashboard:background] photo read failed:', err.message);
+      }
+    }
+  }
+  // solar-system / unknown keys keep the dark tone (with no photo).
+  return result;
+});
+
+ipcMain.handle('dashboard:open', () => {
+  openDashboardWindow();
+  return { ok: true };
+});
+
+// ── Tray pie ──────────────────────────────────────────────────────────────
+// Per-company condition mix over the past 24 hours for the popover's pie:
+// how many pings were healthy / degraded / down. "Degraded" mirrors the
+// dashboard's logic — packet loss, or latency far above the company's own
+// average.
+// Derived consensus mix for a circuit: combine its viewers per minute bucket
+// (red >=50% of viewers down; else amber if any viewer down or degraded; else
+// green) and tally the buckets. The pie's radial thirds + counts read this, so
+// a single viewer's bad path can't paint the whole circuit red.
+ipcMain.handle('companies:pie', (e, windowMs) => {
+  // Optional time filter (tray donut 1hr / 1d / 1w). Default = the retained 24h.
+  const w = Number(windowMs);
+  const useWindow = Number.isFinite(w) && w > 0 && w !== PERSIST_WINDOW_MS;
+  return companyList().map((co) => {
+    const entry = companies.get(co.id);
+    if (!entry) {
+      return { id: co.id, label: co.label, host: co.host || '', online: co.online, healthy: 0, degraded: 0, down: 0, total: 0, viewers: 1, critical: false, criticalCount: 0 };
+    }
+    // The memoized 24h derivation (a cache hit — companyList just ran it) is the
+    // base. For a sub-24h filter (1hr) we just slice its per-minute levels — no
+    // recompute. For a longer filter (1w) we derive over whatever raw history we
+    // still hold (bounded by the 3000-ping cap). 1d uses the base as-is.
+    const base = derivedFor(entry);
+    const viewers = base.viewers;
+    let levels = base.levels;
+    if (useWindow) {
+      const cutoff = Date.now() - w;
+      if (w < PERSIST_WINDOW_MS) {
+        levels = base.levels.filter((l) => l.ms >= cutoff);
+      } else {
+        levels = derivedMinuteLevels((entry.pings || []).filter((p) => Date.parse(p.checkedAt) >= cutoff));
+      }
+    }
+    let healthy = 0, degraded = 0, down = 0;
+    for (const { level } of levels) {
+      if (level === 'red') down += 1;
+      else if (level === 'yellow') degraded += 1;
+      else healthy += 1;
+    }
+    // critical = a SUSTAINED outage right now (>=4 derived-down buckets in a row);
+    // the pie auto-highlights these slices red without needing a hover.
+    const critical = co.online && trailingDownStreakFromLevels(levels) >= CRITICAL_DOWN_STREAK;
+    // criticalCount = how many times this circuit went critical (4-in-a-row) over
+    // the window — the deep-red outer tier's tally (shown only when > 0).
+    const criticalCount = countCriticalEpisodes(levels);
+    return { id: co.id, label: co.label, host: co.host || '', online: co.online, healthy, degraded, down, total: levels.length, viewers, critical, criticalCount };
+  });
+});
+
+// Open the dashboard focused on one company (a clicked pie slice). If the
+// window already exists the company is pushed live; a freshly created window
+// pulls the pending focus once its feed boots.
+let pendingCompanyFocus = null;
+let pendingChartDepth = null; // bar-chart depth to open at (from the donut's time filter)
+ipcMain.handle('dashboard:open-company', (_e, companyId, chartDepth) => {
+  pendingCompanyFocus = String(companyId || '') || null;
+  pendingChartDepth = chartDepth === 'day' || chartDepth === 'hour' ? chartDepth : null;
+  const existing = dashboardWindow && !dashboardWindow.isDestroyed();
+  openDashboardWindow();
+  if (existing && pendingCompanyFocus) {
+    dashboardWindow.webContents.send('dashboard:set-company', { id: pendingCompanyFocus, depth: pendingChartDepth });
+    pendingCompanyFocus = null;
+    pendingChartDepth = null;
+  }
+  return { ok: true };
+});
+
+ipcMain.handle('company:focus:consume', () => {
+  const value = { id: pendingCompanyFocus, depth: pendingChartDepth };
+  pendingCompanyFocus = null;
+  pendingChartDepth = null;
+  return value;
+});
+
+ipcMain.handle('dashboard:close', () => {
+  if (dashboardWindow && !dashboardWindow.isDestroyed()) dashboardWindow.close();
+  return { ok: true };
+});
+
+ipcMain.handle('dashboard:minimize', () => {
+  if (dashboardWindow && !dashboardWindow.isDestroyed()) dashboardWindow.minimize();
+  return { ok: true };
+});
+
+// Window-control IPC used by the dashboard renderer's own frameless chrome
+// (window-control-cluster buttons → dashboardWindowControls bridge).
+
+function isDashboardSender(e) {
+  return dashboardWindow
+    && !dashboardWindow.isDestroyed()
+    && e.sender === dashboardWindow.webContents;
+}
+
+ipcMain.handle('dashboard-window:reload', (e) => {
+  if (!isDashboardSender(e)) return { ok: false };
+  dashboardWindow.webContents.reload();
+  return { ok: true };
+});
+
+ipcMain.handle('dashboard-window:minimize', (e) => {
+  if (!isDashboardSender(e)) return { ok: false };
+  dashboardWindow.minimize();
+  return { ok: true };
+});
+
+ipcMain.handle('dashboard-window:close', (e) => {
+  if (!isDashboardSender(e)) return { ok: false };
+  dashboardWindow.close();
+  return { ok: true };
+});
+
+// ─── Accounts / auth ─────────────────────────────────────────────────────────
+
+function broadcastAuth() {
+  const payload = auth.session();
+  BrowserWindow.getAllWindows().forEach((w) => {
+    if (w && !w.isDestroyed()) w.webContents.send('auth:changed', payload);
+  });
+}
+
+function canManageUsers() {
+  const s = auth.session();
+  return !!(s.user && (s.user.isAdmin || s.user.permissions.canManageUsers));
+}
+
+ipcMain.handle('auth:session', () => auth.session());
+
+ipcMain.handle('auth:login', (_e, { username, password } = {}) => {
+  const result = auth.login(username, password);
+  if (result.ok) { seedDefaultLayoutForUser(auth.currentUser()); broadcastAuth(); updateTray(lastTrayStatus); }
+  return result;
+});
+
+ipcMain.handle('auth:logout', () => {
+  const result = auth.logout();
+  broadcastAuth();
+  updateTray(lastTrayStatus);
+  return result;
+});
+
+ipcMain.handle('auth:register', (_e, payload) => {
+  const result = auth.register(payload || {});
+  if (result.ok) { seedDefaultLayoutForUser(auth.currentUser()); broadcastAuth(); updateTray(lastTrayStatus); }
+  return result;
+});
+
+ipcMain.handle('auth:set-password', (_e, { password } = {}) => {
+  const result = auth.setOwnPassword(password);
+  if (result.ok) broadcastAuth();
+  return result;
+});
+
+ipcMain.handle('auth:list-users', () => (
+  canManageUsers() ? { ok: true, users: auth.listUsers() } : { ok: false, error: 'Not allowed' }
+));
+
+ipcMain.handle('auth:create-user', (_e, payload) => (
+  canManageUsers() ? auth.createUser(payload || {}) : { ok: false, error: 'Not allowed' }
+));
+
+ipcMain.handle('auth:update-user', (_e, { username, ...rest } = {}) => (
+  canManageUsers() ? auth.updateUser(username, rest) : { ok: false, error: 'Not allowed' }
+));
+
+ipcMain.handle('auth:delete-user', (_e, { username } = {}) => (
+  canManageUsers() ? auth.deleteUser(username) : { ok: false, error: 'Not allowed' }
+));
+
+// Synchronous lookup so a preload can pick the signed-in user's layout store.
+ipcMain.on('auth:current-username', (e) => { e.returnValue = auth.currentUser() || ''; });
+
+ipcMain.handle('history:get', async () => {
+  // The ESET source has no REST history endpoint; live detections arrive through
+  // the detection feed (mqtt:check). The dashboard handles history being absent.
+  return { ok: false, error: 'history endpoint not available' };
+});

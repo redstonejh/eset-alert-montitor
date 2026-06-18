@@ -1,0 +1,657 @@
+/* ============================================================
+   Tray popover — minimal, white, liquid-glass.
+   The window is transparent; when the dashboard's WebGL glass is
+   active (body.webgl-glass-on) the panel keeps no opaque fill so the
+   shader-refracted backdrop is the surface. Text is white-only; the
+   single status color is reserved for the centered status ring.
+   ============================================================ */
+
+:root {
+  --green: #32d74b;
+  --amber: #ffd60a;
+  --red:   #ff453a;
+  --neutral: rgba(255, 255, 255, 0.9);
+
+  --text: rgba(255, 255, 255, 0.98);
+  --text-soft: rgba(255, 255, 255, 0.72);
+
+  --glass-line: rgba(255, 255, 255, 0.16);
+  --glass-line-strong: rgba(255, 255, 255, 0.5);
+  --text-shadow: 0 1px 2px rgba(0, 0, 0, 0.55), 0 0 2px rgba(0, 0, 0, 0.35);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { width: 100%; height: 100%; }
+
+body {
+  font-family: -apple-system, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  background: transparent;
+  color: var(--text);
+  user-select: none;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+#root {
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  pointer-events: none;
+}
+
+button, input, a { -webkit-app-region: no-drag; }
+
+/* WebGL glass canvas (inserted by liquid-glass-webgl.js). It sits at z:0; the
+   UI must be promoted above it so the panel renders over the refraction. */
+.liquid-glass-webgl-canvas {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  display: none;
+}
+body.webgl-glass-on .liquid-glass-webgl-canvas { display: block; }
+body.webgl-glass-on #root { position: relative; z-index: 1; }
+
+/* ─── Panel ──────────────────────────────────────────────────────────────── */
+
+.panel {
+  position: relative;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  border-radius: 20px;
+  overflow: hidden;
+  /* Acrylic: a dark-grey TINT (the dashboard's #1f2937 tone) at moderate opacity so
+     the window's OS acrylic (DWM frosts the desktop/apps behind the popover) shows
+     through — a translucent frosted dark-grey glass, not a flat solid slab. */
+  background: linear-gradient(180deg, rgba(31, 41, 55, 0.55), rgba(24, 32, 44, 0.5));
+  -webkit-backdrop-filter: blur(18px) saturate(135%);
+  backdrop-filter: blur(18px) saturate(135%);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.26),
+    inset 0 -10px 22px rgba(0, 0, 0, 0.14),
+    0 10px 28px rgba(0, 0, 0, 0.22);
+  -webkit-app-region: no-drag;
+  pointer-events: auto;
+  will-change: clip-path, transform, opacity;
+  color: var(--text);
+}
+
+/* Use the CSS acrylic above in ALL states — do NOT defer to the WebGL glass
+   shader (it's hidden below). Only add the text shadow for legibility. */
+body.webgl-glass-on .panel {
+  text-shadow: var(--text-shadow);
+}
+/* The tray uses CSS acrylic, not the WebGL liquid-glass — hide its canvas so the
+   acrylic frosts the real backdrop instead of the shader render. */
+body.webgl-glass-on .liquid-glass-webgl-canvas { display: none !important; }
+
+/* Windows: the OS acrylic window is rounded by DWM at its own native radius, so
+   the panel is squared to fill it exactly — a CSS radius here would leave bare
+   blurred-acrylic wedges in the corners. The well tint from .panel stays. */
+body.win-acrylic .panel,
+body.win-acrylic .panel.peek { border-radius: 0; }
+
+.panel.peek { max-height: 96px; border-radius: 18px; }
+/* No cap: the panel grows to its content (e.g. when "Manual setup" expands) so
+   the ResizeObserver fires and the window grows; main clamps the final height. */
+.panel.expanded { max-height: none; }
+/* Submenus (Settings, Profile) match the STATUS view's height (donut + time
+   filters → a 283px scroll area) so the window NEVER shrinks when you open them —
+   it stays one size. "Manual setup" (a <details>) expands the Settings view beyond
+   this floor on demand; min-height only sets the floor, so growth still works. */
+.panel.view-settings .panel-scroll,
+.panel.view-profile .panel-scroll { min-height: 283px; }
+.panel.edge-bottom { margin-top: auto; transform-origin: bottom center; }
+.panel.edge-top { margin-bottom: auto; transform-origin: top center; }
+
+.panel.expanded.revealing.edge-bottom { animation: revealFromBottom 160ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.panel.expanded.revealing.edge-top { animation: revealFromTop 160ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.panel.expanded.revealing.edge-left { animation: revealFromLeft 160ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+.panel.expanded.revealing.edge-right { animation: revealFromRight 160ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+@keyframes revealFromBottom { from { clip-path: inset(calc(100% - 96px) 0 0 0); opacity: 0.98; transform: translateY(2px); } to { clip-path: inset(0); opacity: 1; transform: none; } }
+@keyframes revealFromTop { from { clip-path: inset(0 0 calc(100% - 96px) 0); opacity: 0.98; transform: translateY(-2px); } to { clip-path: inset(0); opacity: 1; transform: none; } }
+@keyframes revealFromLeft { from { clip-path: inset(0 calc(100% - 96px) 0 0); opacity: 0.98; transform: translateX(-2px); } to { clip-path: inset(0); opacity: 1; transform: none; } }
+@keyframes revealFromRight { from { clip-path: inset(0 0 0 calc(100% - 96px)); opacity: 0.98; transform: translateX(2px); } to { clip-path: inset(0); opacity: 1; transform: none; } }
+
+.panel-scroll { position: relative; z-index: 1; flex: 1; overflow: visible; }
+.content-reveal { animation: contentReveal 150ms ease-out both; }
+@keyframes contentReveal { from { opacity: 0; transform: translateY(-5px); } to { opacity: 1; transform: none; } }
+
+/* Whisper-quiet status wash at the very top — never a solid color block. */
+.tint { position: absolute; inset: 0; pointer-events: none; z-index: 0; }
+.tint.green { background: radial-gradient(120% 70% at 50% -22%, rgba(50, 215, 75, 0.20), transparent 60%); }
+.tint.amber { background: radial-gradient(120% 70% at 50% -22%, rgba(255, 214, 10, 0.16), transparent 60%); }
+.tint.red   { background: radial-gradient(120% 70% at 50% -22%, rgba(255, 69, 58, 0.16), transparent 60%); }
+.tint.neutral { background: none; }
+
+/* ─── Top bar (no brand text — the status is the content) ─────────────────── */
+
+.topbar {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 8px 8px 0;
+}
+.topbar-spacer { flex: 1; }
+
+/* Top-left type-ahead search: filtering letters progressively highlight the
+   matching company slice in the fleet pie (Windows desktop type-ahead style). */
+.fleet-search {
+  -webkit-app-region: no-drag;
+  height: 28px;
+  width: 136px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  outline: none !important;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.fleet-search::placeholder { color: rgba(255, 255, 255, 0.42); }
+.fleet-search:focus {
+  border-color: rgba(255, 255, 255, 0.42);
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.icon-btn {
+  -webkit-app-region: no-drag;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  min-width: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-soft);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.icon-btn:hover { background: rgba(255, 255, 255, 0.12); color: var(--text); }
+.icon-btn:disabled { opacity: 0.5; cursor: default; }
+/* The button for the view you're currently in reads as gently lit — a premium
+   "you are here" cue (colour-only, never a blue/filled slab). */
+.icon-btn.is-active { background: rgba(255, 255, 255, 0.14); color: var(--text); }
+
+/* The dashboard button reads as a clear, clickable glass pill that stands out
+   from the plain icon controls, with a gently bouncing chevron. */
+.open-dash {
+  height: 28px;
+  padding: 0 12px 0 10px;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #ffffff;
+  background: rgba(124, 128, 136, 0.48);
+  -webkit-backdrop-filter: blur(16px) saturate(125%);
+  backdrop-filter: blur(16px) saturate(125%);
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  border-radius: 9px;
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.30),
+    inset 0 1px 0 rgba(255, 255, 255, 0.24);
+}
+.open-dash:hover {
+  background: rgba(142, 146, 154, 0.58);
+  border-color: rgba(255, 255, 255, 0.42);
+  color: #ffffff;
+  transform: translateY(-1px);
+  box-shadow:
+    0 8px 22px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+.open-dash:active { transform: translateY(0); }
+.open-dash .chev { font-size: 12px; }
+.open-dash-label { letter-spacing: 0.01em; }
+
+/* ─── Status hero — centered condition, minimal words ────────────────────── */
+
+.status-hero {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 16px 26px 28px;
+}
+
+/* ─── Fleet pie — one slice per client, HP-split over the past 24h ───────── */
+
+.fleet-pie-wrap {
+  position: relative;
+  width: 204px;
+  height: 204px;
+  margin: 2px auto 6px;
+  overflow: visible; /* let the hover glow extend past the donut bounds */
+}
+.fleet-pie { width: 100%; height: 100%; display: block; overflow: visible; }
+.fleet-slice { cursor: pointer; transition: opacity 0.18s ease, filter 0.18s ease; }
+/* Rounded slice edges are produced GEOMETRICALLY in the path (roundedRingSlicePath
+   in StatusPanel) — only the donut's outer/inner extremes are rounded, so multi-
+   band slices have no internal notches. Round joins keep any remaining corners
+   soft. */
+.fleet-slice path { stroke-linejoin: round; stroke-linecap: round; }
+/* Hover highlight identical to the dashboard bar chart's ECharts emphasis:
+   white 2px border + a 16px white glow (shadowBlur 16, rgba(255,255,255,0.85)). */
+/* Auto-highlight (no hover needed): a circuit in a SUSTAINED outage — 4+ derived
+   fails in a row — glows red, the exact same treatment as the white hover ring
+   but in red. Declared before the hover/match rule so hovering still wins. */
+/* The highlight is ONE outline around the whole slice perimeter (a single overlaid
+   path), NOT a stroke per coloured band — so a multi-tier slice gets one clean ring,
+   never a box drawn around each third. */
+.fleet-slice-outline { fill: none; stroke: none; pointer-events: none; transition: filter 0.18s ease; }
+.fleet-slice.is-critical .fleet-slice-outline {
+  stroke: #ff5b52;
+  stroke-width: 2;
+  filter: drop-shadow(0 0 16px rgba(255, 91, 82, 0.9));
+}
+.fleet-slice:hover .fleet-slice-outline,
+.fleet-slice.is-match .fleet-slice-outline {
+  stroke: #ffffff;
+  stroke-width: 2;
+  filter: drop-shadow(0 0 16px rgba(255, 255, 255, 0.85));
+}
+.fleet-slice.offline { opacity: 0.55; }
+/* Count of derived degraded / down buckets, printed inside its band. */
+.fleet-slice-count {
+  fill: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.35);
+  stroke-width: 2px;
+  pointer-events: none;
+}
+.fleet-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  text-align: center;
+}
+.fleet-center-title {
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.2;
+  color: var(--text);
+  max-width: 82px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.fleet-center-sub {
+  margin-top: 3px;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: var(--text-soft);
+  max-width: 86px;
+}
+.fleet-center.green .fleet-center-sub   { color: var(--green); }
+.fleet-center.amber .fleet-center-sub   { color: var(--amber); }
+.fleet-center.red .fleet-center-sub     { color: var(--red); }
+.fleet-center.neutral .fleet-center-sub { color: var(--text-soft); }
+.status-hero.green   { --accent: var(--green); }
+.status-hero.amber   { --accent: var(--amber); }
+.status-hero.red     { --accent: var(--red); }
+.status-hero.neutral { --accent: var(--neutral); }
+
+/* Donut time filters — plain clickable text under the pie (never a box/pill). The
+   active window is brighter with a thin underline; the rest are muted. Colour-only,
+   matching the dashboard's text-style time filter. */
+.fleet-filters { display: flex; justify-content: center; gap: 16px; margin: 4px auto 0; }
+.fleet-filter {
+  -webkit-app-region: no-drag;
+  position: relative;
+  background: transparent; border: 0; padding: 2px 2px 5px; cursor: pointer;
+  font: inherit; font-size: 12px; font-weight: 600; letter-spacing: 0.01em;
+  color: var(--text-soft); transition: color 0.14s ease;
+}
+.fleet-filter:hover { color: var(--text); }
+.fleet-filter.is-active { color: var(--text); }
+.fleet-filter.is-active::after {
+  content: ""; position: absolute; left: 2px; right: 2px; bottom: 0;
+  height: 2px; border-radius: 2px; background: currentColor; opacity: 0.85;
+}
+.fleet-filter:focus-visible { outline: 2px solid rgba(255, 255, 255, 0.5); outline-offset: 2px; border-radius: 5px; }
+
+.status-ring {
+  width: 78px;
+  height: 78px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  box-shadow: 0 0 30px -8px var(--accent), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+}
+.status-mark { font-size: 34px; line-height: 1; font-weight: 300; color: var(--accent); }
+
+.status-title {
+  margin-top: 16px;
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.status-detail {
+  margin-top: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-soft);
+  max-width: 232px;
+}
+.status-time {
+  margin-top: 12px;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--text-soft);
+  opacity: 0.85;
+}
+
+/* ─── Peek (hover glance) ────────────────────────────────────────────────── */
+
+.peek {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 96px;
+  padding: 0 18px;
+}
+.peek.green   { --accent: var(--green); }
+.peek.amber   { --accent: var(--amber); }
+.peek.red     { --accent: var(--red); }
+.peek.neutral { --accent: var(--neutral); }
+
+.peek-dot {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  box-shadow: 0 0 18px -6px var(--accent), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  color: var(--accent);
+  font-size: 17px;
+  font-weight: 300;
+}
+.peek-copy { min-width: 0; display: flex; flex-direction: column; }
+.peek-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.peek-sub {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ─── Settings — uncluttered, white, glass-native ────────────────────────── */
+
+.settings {
+  padding: 4px 18px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.settings-lead {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-soft);
+}
+.input-row { display: flex; gap: 8px; }
+.input-row .field { flex: 1; }
+
+.field {
+  -webkit-app-region: no-drag;
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--glass-line);
+  border-radius: 10px;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.field::placeholder { color: rgba(255, 255, 255, 0.4); }
+.field:focus { border-color: var(--glass-line-strong); background: rgba(255, 255, 255, 0.09); }
+.field.mono { font-family: ui-monospace, "SF Mono", "Cascadia Mono", monospace; font-size: 11.5px; letter-spacing: -0.01em; }
+
+.settings-divider { height: 1px; background: var(--glass-line); }
+
+.settings-advanced { -webkit-app-region: no-drag; }
+.settings-advanced > summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-soft);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+}
+.settings-advanced > summary::-webkit-details-marker { display: none; }
+.settings-advanced > summary::before {
+  content: "›";
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 14px;
+}
+.settings-advanced[open] > summary::before { transform: rotate(90deg); }
+.settings-advanced:hover > summary { color: var(--text); }
+
+.settings-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-top: 12px;
+}
+.settings-field { display: flex; flex-direction: column; gap: 5px; }
+.settings-field.full { grid-column: 1 / -1; }
+.settings-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-soft);
+}
+
+.settings-error { font-size: 12px; color: #ff8f8f; }
+
+.btn-primary {
+  -webkit-app-region: no-drag;
+  width: 100%;
+  height: 38px;
+  border: 0;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #0b0d12;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
+}
+.btn-primary:hover { background: #ffffff; }
+.btn-primary:active { transform: translateY(1px); }
+.btn-primary:disabled { opacity: 0.55; cursor: default; }
+
+.btn-ghost {
+  -webkit-app-region: no-drag;
+  height: 36px;
+  padding: 0 16px;
+  border: 1px solid var(--glass-line-strong);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.btn-ghost:hover { background: rgba(255, 255, 255, 0.1); }
+.btn-ghost:disabled { opacity: 0.55; cursor: default; }
+
+.btn-link {
+  align-self: center;
+  background: transparent;
+  border: 0;
+  padding: 2px;
+  color: var(--text-soft);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.btn-link:hover { color: var(--text); text-decoration: underline; }
+
+/* ─── Account (profile button, sign-in, profile view) ────────────────────── */
+
+.topbar-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: rgba(255, 255, 255, 0.92);
+}
+.topbar-avatar-glyph {
+  width: 17px;
+  height: 17px;
+  display: block;
+}
+.profile-card {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 4px 2px 2px;
+}
+.profile-avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  flex: none;
+  background: linear-gradient(150deg, rgba(120, 170, 255, 0.95), rgba(90, 120, 210, 0.95));
+  color: #ffffff;
+  font-size: 17px;
+  font-weight: 700;
+}
+.profile-id { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.profile-id > strong { font-size: 15px; font-weight: 600; color: var(--text); }
+.role-badge {
+  align-self: flex-start;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text-soft);
+}
+.role-badge.role-admin { background: rgba(120, 170, 255, 0.22); color: #aecbff; }
+.role-badge.role-editor { background: rgba(110, 220, 150, 0.2); color: #8fe0b0; }
+.profile-note { font-size: 12px; color: var(--text-soft); }
+.profile-signout { width: 100%; }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.22); border-radius: 3px; }
+
+/* ─── Motion ──────────────────────────────────────────────────────────────
+   The status condition morphs color smoothly when it changes; the glyph pops
+   gently (it is React-keyed on the mark, so it remounts on change). */
+.status-ring { transition: border-color 0.4s ease, background 0.4s ease, box-shadow 0.4s ease; }
+.status-mark { transition: color 0.4s ease; animation: markPop 0.32s cubic-bezier(0.2, 1.2, 0.3, 1) both; }
+.status-title { transition: color 0.25s ease; }
+.peek-dot { transition: border-color 0.4s ease, background 0.4s ease, box-shadow 0.4s ease, color 0.4s ease; }
+
+@keyframes markPop { from { opacity: 0; transform: scale(0.6); } to { opacity: 1; transform: none; } }
+
+/* Red draws the eye: a slow, low-amplitude glow breathe (only when red). The
+   0%/100% keyframes match the resting shadow so starting/stopping is seamless. */
+.status-hero.red .status-ring { animation: ringPulse 2.6s ease-in-out infinite; }
+.peek.red .peek-dot { animation: dotPulse 2.6s ease-in-out infinite; }
+@keyframes ringPulse {
+  0%, 100% { box-shadow: 0 0 30px -8px var(--accent), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
+  50%      { box-shadow: 0 0 40px -3px var(--accent), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
+}
+@keyframes dotPulse {
+  0%, 100% { box-shadow: 0 0 18px -6px var(--accent), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
+  50%      { box-shadow: 0 0 26px -2px var(--accent), inset 0 1px 0 rgba(255, 255, 255, 0.4); }
+}
+
+/* Connecting spinner — a quiet rotating arc shown while waiting for status. */
+.spinner {
+  border-radius: 50%;
+  border: 2.5px solid rgba(255, 255, 255, 0.22);
+  border-top-color: var(--accent);
+  animation: spin 0.9s linear infinite;
+}
+.status-ring .spinner { width: 30px; height: 30px; }
+.peek-dot .spinner { width: 18px; height: 18px; border-width: 2px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* The open-dashboard pill lifts on hover; its chevron gently bounces upward to
+   draw the eye and hint it opens the dashboard above. */
+.open-dash { transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease; }
+.open-dash .chev { animation: chevBounce 1.7s ease-in-out infinite; }
+@keyframes chevBounce {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+}
+
+/* Keyboard focus: a soft white ring (mouse clicks stay clean via :focus-visible). */
+.icon-btn:focus-visible,
+.btn-primary:focus-visible,
+.btn-ghost:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.6);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .panel.expanded.revealing.edge-bottom,
+  .panel.expanded.revealing.edge-top,
+  .panel.expanded.revealing.edge-left,
+  .panel.expanded.revealing.edge-right,
+  .content-reveal { animation: none; }
+  .status-ring, .status-mark, .status-title, .peek-dot { transition: none; }
+  .status-mark,
+  .status-hero.red .status-ring,
+  .peek.red .peek-dot { animation: none; }
+  .open-dash { transition: none; }
+  .open-dash:hover { transform: none; }
+  .open-dash .chev { animation: none; }
+  .spinner { animation: none; border-top-color: rgba(255, 255, 255, 0.6); }
+}

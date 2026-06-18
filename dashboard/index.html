@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en" data-dashboard-booting>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    Content-Security-Policy. This window loads over file:// and exposes a
+    node:fs persistence bridge, so the hard rule is: no REMOTE script may run.
+    script-src lists only local schemes (self/file/blob) plus 'unsafe-inline'
+    for the boot script below and the runtime-injected <style> blocks — no
+    https host — so a compromised CDN can no longer inject executable code.
+    Visualization libraries are vendored under app/static/vendor/.
+    Remote DATA (cannot execute here) stays allowed where a widget needs it:
+    OpenStreetMap tiles via img-src https:, and YouTube/Vimeo embeds via
+    frame-src. blob: in worker-src is Monaco's stubbed (empty) worker.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; script-src 'self' file: blob: 'unsafe-inline' 'unsafe-eval'; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data: blob: https:; font-src 'self' file: data:; connect-src 'self' file: data:; worker-src 'self' file: blob:; media-src 'self' file: blob:; frame-src https://www.youtube-nocookie.com https://player.vimeo.com; object-src 'none'; base-uri 'self'">
+  <title>Status Monitor Dashboard</title>
+  <script>
+    (() => {
+      try {
+        const saved = localStorage.getItem("dashboard-background") || "tone-dark-grey";
+        const presets = {
+          "tone-light-grey": "#d1d5db",
+          "tone-grey": "#6b7280",
+          "tone-dark-grey": "#1f2937",
+          "tone-black": "#000000",
+        };
+        let background = saved;
+        let baseTone = "";
+        if (saved.startsWith("{")) {
+          background = "tone-dark-grey";
+          baseTone = presets[background];
+        } else if (!saved.startsWith("photo-") && saved !== "solar-system") {
+          background = presets[saved] ? saved : "tone-dark-grey";
+          baseTone = presets[background];
+        }
+        if (baseTone) {
+          document.documentElement.style.setProperty("--base-tone", baseTone);
+          document.documentElement.style.setProperty("--bg", baseTone);
+          document.documentElement.style.setProperty("--bg-end", baseTone);
+        }
+        document.documentElement.dataset.background = background;
+      } catch {}
+    })();
+  </script>
+  <style>
+    html[data-dashboard-booting] .page,
+    html[data-dashboard-booting] .toast-stack,
+    html[data-dashboard-booting] dialog {
+      visibility: hidden;
+    }
+  </style>
+  <link rel="stylesheet" href="./app/static/tokens.css">
+  <link rel="stylesheet" href="./app/static/base.css">
+  <link rel="stylesheet" href="./app/static/layout.css">
+  <link rel="stylesheet" href="./app/static/components.css">
+  <link rel="stylesheet" href="./app/static/dashboard-grid.css">
+  <link rel="stylesheet" href="./app/static/themes.css">
+  <link rel="stylesheet" href="./app/static/utilities.css">
+</head>
+<body>
+  <!-- Loading gate: covers the initial boot (layout + history load + first widget
+       render) so the dashboard never shows a half-built/janky UI. Cleared by
+       status-feed.js after the first publish renders, with a safety timeout. -->
+  <div id="db-loading" class="db-loading"><div class="db-loading-spinner" aria-label="Loading"></div></div>
+  <main class="page">
+
+<div class="app-window-drag-region" aria-hidden="true"></div>
+<!-- Top-left: the account button (injected by auth-ui.js, leftmost) and the
+     dashboard-controls gear beside it. Top-right: minimize, refresh, close —
+     close anchored furthest right. -->
+<div class="window-control-cluster window-control-cluster-left" aria-label="Dashboard controls">
+  <details class="background-tone-menu bg-picker">
+    <summary class="background-tone-trigger window-glass-control control-bar-background" aria-label="Workspace background" title="Background"><span class="background-tone-dot" aria-hidden="true"></span></summary>
+    <div class="background-tone-popover bg-picker-pop">
+      <div class="background-tone-group glass-fx-group" aria-label="Visual effects">
+        <span class="background-tone-label">Effects</span>
+        <button type="button" class="glass-fx-toggle" aria-pressed="false" title="Toggle the liquid-glass effect">
+          <span class="glass-fx-name">Liquid glass</span>
+          <span class="glass-fx-switch" aria-hidden="true"></span>
+        </button>
+      </div>
+      <div class="background-tone-group background-tone-group-derived" aria-label="Color backgrounds">
+        <span class="background-tone-label">Color</span>
+        <button type="button" class="background-tone-option" data-background-tone="tone-light-grey" style="--base-tone: #d1d5db;">Light grey</button>
+        <button type="button" class="background-tone-option" data-background-tone="tone-grey" style="--base-tone: #6b7280;">Grey</button>
+        <button type="button" class="background-tone-option" data-background-tone="tone-dark-grey" style="--base-tone: #1f2937;">Dark grey</button>
+        <button type="button" class="background-tone-option" data-background-tone="tone-black" style="--base-tone: #000000;">Black</button>
+      </div>
+      <div class="background-photo-group" aria-label="Nature photo backgrounds">
+        <span class="background-tone-label">Nature</span>
+        <button type="button" class="background-photo-option" data-background-tone="photo-bark">Bark</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-cloud">Clouds</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-jungle">Jungle</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-moss">Moss</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-sand">Sand</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-shore">Shore</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-turf">Turf</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-water">Ocean</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-water2">Water</button>
+      </div>
+      <div class="background-photo-group" aria-label="Texture photo backgrounds">
+        <span class="background-tone-label">Textures</span>
+        <button type="button" class="background-photo-option" data-background-tone="photo-denim">Denim</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-marble">Marble</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-leather">Leather</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-texture">Stone</button>
+      </div>
+      <div class="background-photo-group" aria-label="Abstract and urban photo backgrounds">
+        <span class="background-tone-label">Abstract &amp; Urban</span>
+        <button type="button" class="background-photo-option" data-background-tone="photo-paint">Paint</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-paintspill">Spill</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-city">City</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-modern">Modern</button>
+      </div>
+      <div class="background-photo-group" aria-label="Space photo backgrounds">
+        <span class="background-tone-label">Space</span>
+        <button type="button" class="background-photo-option" data-background-tone="photo-mercury">Mercury</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-venus">Venus</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-earth">Earth</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-mars">Mars</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-jupiter">Jupiter</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-saturn">Saturn</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-uranus">Uranus</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-neptune">Neptune</button>
+        <button type="button" class="background-photo-option" data-background-tone="photo-pluto">Pluto</button>
+      </div>
+    </div>
+  </details>
+  <button class="window-glass-control control-bar-search" type="button" aria-label="Search circuits" aria-expanded="false" aria-controls="dashboard-search-popover" title="Search circuits"></button>
+</div>
+<!-- Search popover: type a name or IP; matching circuit tabs appear below and
+     clicking one navigates to it. Positioned under the search button by JS. -->
+<div class="dashboard-search-popover" id="dashboard-search-popover" hidden>
+  <input class="dashboard-search-input" type="text" placeholder="Search name or IP…" aria-label="Search circuits" autocomplete="off" spellcheck="false" />
+  <div class="dashboard-search-results" role="listbox" aria-label="Matching circuits"></div>
+</div>
+<div class="window-control-cluster" aria-label="Window controls">
+  <button class="window-glass-control window-minimize-control" type="button" aria-label="Minimize app" title="Minimize app"></button>
+  <button class="window-glass-control window-refresh-control" type="button" aria-label="Reload dashboard" title="Reload dashboard"></button>
+  <button class="window-glass-control window-close-control" type="button" aria-label="Close app" title="Close app"></button>
+</div>
+<header class="app-nav workspace-chrome floating-control-bar" id="dashboard-control-bar" data-floating-control-bar aria-hidden="true">
+  <div class="control-bar-drag-handle" aria-hidden="true"></div>
+  <div class="app-nav-status" aria-label="Dashboard controls">
+    <div class="workspace-command-island layout-command-island" aria-label="Layout and persistence">
+      <div class="layout-slot-controls" aria-label="Workspace persistence">
+        <button class="layout-slot-button layout-save-button" type="button" data-layout-target="builder">Save</button>
+        <button class="layout-slot-button layout-load-button" type="button" data-layout-target="builder">Load</button>
+      </div>
+    </div>
+    <div class="workspace-command-island composition-command-island" aria-label="Composition">
+      <button class="panel-undo-button composition-rocker-control composition-undo-button" type="button" data-layout-target="builder" aria-label="Undo last layout change" title="Undo last layout change"><span class="chrome-rocker-glyph" aria-hidden="true">-</span></button>
+      <div class="panel-add-picker" data-layout-target="builder">
+      <button class="panel-add-button composition-rocker-control composition-add-button" type="button" aria-label="Add dashboard object" aria-haspopup="true" aria-expanded="false" title="Add dashboard object"><span class="chrome-add-glyph" aria-hidden="true">+</span></button>
+      <div class="panel-add-menu nav-menu-shell floating-glass-menu">
+        <div class="object-add-browser glass-menu-scroll-region" role="menu" aria-label="Add object categories"></div>
+      </div>
+      </div>
+    </div>
+    <div class="workspace-command-island mode-command-island" aria-label="Interaction modes">
+      <button class="panel-reset-button restore-layout-button" type="button" data-layout-target="builder" aria-label="Reset to default layout" title="Reset to default layout">Reset</button>
+    </div>
+  </div>
+  <!-- Appearance/background picker moved to the top-left background button. The
+       layout builder tools above (app-nav-status) are kept but the whole control
+       bar is hidden (see #dashboard-control-bar in themes.css). -->
+</header>
+
+<nav class="workspace-tab-bar" aria-label="Workspace tabs" data-workspace-tabs></nav>
+
+<div class="workspace-menu-overlay-layer" aria-hidden="true"></div>
+<!--
+  Default Status Monitor layout. Built only from preexisting widget types
+  (timeframe / tracker / graph / table) fed live by status-feed.js: the four
+  trackers receive the check counts, the chart plots status level over time,
+  the table lists recent checks. Users can rearrange, recolor and rename from
+  here; a fresh account starts on this view.
+-->
+<div class="dashboard-layout-grid" data-dashboard-layout-key="builder">
+  <!-- The stat band stays (empty) — it is the workspace layout panel children
+       extract into when dragged out of a panel. -->
+  <div class="stat-band widget-layout" data-widget-layout-key="builder">
+  </div>
+
+  <div class="panel-layout" data-layout-key="builder">
+    <section class="db-panel db-panel-collapsed" data-panel-key="builder-metrics" data-default-span="6" data-default-grid-col="1" data-default-grid-row="1" data-grid-col="1" data-grid-row="1" data-grid-row-span="1" data-default-title="Metrics">
+      <div class="db-panel-hd db-panel-hd-items">
+        <span class="db-panel-title">Metrics</span>
+        <span class="db-panel-count">0</span>
+        <div class="panel-tools">
+          <div class="panel-tool-drawer" aria-label="Panel tools">
+            <button class="panel-tool-button panel-move-handle" type="button" aria-label="Move panel" title="Move panel"><span class="move-icon" aria-hidden="true"></span></button>
+            <button class="panel-tool-button panel-resize-handle" type="button" aria-label="Resize panel" title="Resize panel"><span class="resize-icon" aria-hidden="true"></span></button>
+            <button class="panel-tool-button panel-pin-toggle" type="button" aria-label="Pin panel" aria-pressed="false" title="Pin panel"><span class="pin-icon" aria-hidden="true"></span></button>
+            <button class="panel-tool-button panel-title-handle" type="button" aria-label="Rename panel" title="Rename panel"><span class="text-icon" aria-hidden="true"></span></button>
+            <button class="panel-tool-button panel-color-toggle" type="button" aria-label="Panel colors" aria-expanded="false" title="Panel colors" data-default-theme="#ffffff"><span class="color-icon" aria-hidden="true"></span></button>
+          </div>
+        </div>
+      </div>
+      <div class="db-panel-body">
+        <div class="panel-internal-widget-grid" data-widget-layout-key="builder-metrics">
+          <!-- Row 1 — timeframe controls, then availability: uptime, fails,
+               time since last downtime. -->
+          <div class="widget-card" data-widget-key="widget-timeframe" data-widget-type="timeframe" data-widget-config='{"selectedFilterId":"last_1_day","selectedPreset":"last_1_day","activeLabel":"1d"}' data-default-span="2" data-default-grid-col="1" data-default-grid-row="1" data-grid-col="1" data-grid-row="1" data-grid-row-span="1"></div>
+          <a class="stat-card widget-card" data-widget-key="widget-uptime" data-widget-type="tracker" data-widget-config='{"metric":"avg","valueField":"up","label":"Uptime %","title":"Uptime %","format":"percent","statusMode":"uptime"}' data-default-span="1" data-default-grid-col="3" data-default-grid-row="1" data-grid-col="3" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Uptime %</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-fails" data-widget-type="tracker" data-widget-config='{"metric":"count","label":"Fails","title":"Fails","format":"number","statusMode":"fails"}' data-default-span="1" data-default-grid-col="4" data-default-grid-row="1" data-grid-col="4" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Fails</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-sincedown" data-widget-type="tracker" data-widget-config='{"metric":"max","valueField":"checkedAtMs","label":"Since last downtime","title":"Since last downtime","format":"since","statusMode":"sincedown"}' data-default-span="1" data-default-grid-col="5" data-default-grid-row="1" data-grid-col="5" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">—</span><span class="stat-lbl">Since last downtime</span></a>
+          <!-- Row 2 — latency trio then packet-loss trio. -->
+          <a class="stat-card widget-card" data-widget-key="widget-avgms" data-widget-type="tracker" data-widget-config='{"metric":"avg","valueField":"latencyMs","label":"Avg ms","title":"Avg ms","format":"number","statusMode":"latency-avg"}' data-default-span="1" data-default-grid-col="1" data-default-grid-row="2" data-grid-col="1" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Avg ms</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-minms" data-widget-type="tracker" data-widget-config='{"metric":"min","valueField":"latencyMs","label":"Min ms","title":"Min ms","format":"number","statusMode":"latency-min"}' data-default-span="1" data-default-grid-col="2" data-default-grid-row="2" data-grid-col="2" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Min ms</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-maxms" data-widget-type="tracker" data-widget-config='{"metric":"max","valueField":"latencyMs","label":"Max ms","title":"Max ms","format":"number","statusMode":"latency-max"}' data-default-span="1" data-default-grid-col="3" data-default-grid-row="2" data-grid-col="3" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Max ms</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-loss" data-widget-type="tracker" data-widget-config='{"metric":"avg","valueField":"packetLossPct","label":"Avg loss %","title":"Avg loss %","format":"number","statusMode":"loss-avg"}' data-default-span="1" data-default-grid-col="4" data-default-grid-row="2" data-grid-col="4" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Avg loss %</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-lossmin" data-widget-type="tracker" data-widget-config='{"metric":"min","valueField":"packetLossPct","label":"Min loss %","title":"Min loss %","format":"number","statusMode":"loss-min"}' data-default-span="1" data-default-grid-col="5" data-default-grid-row="2" data-grid-col="5" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Min loss %</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-lossmax" data-widget-type="tracker" data-widget-config='{"metric":"max","valueField":"packetLossPct","label":"Max loss %","title":"Max loss %","format":"number","statusMode":"loss-max"}' data-default-span="1" data-default-grid-col="6" data-default-grid-row="2" data-grid-col="6" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Max loss %</span></a>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div class="widget-layout" data-widget-layout-key="builder-chart">
+    <div class="widget-card" data-widget-key="widget-trend" data-widget-type="graph" data-widget-runtime-type="chart" data-widget-config='{"title":"Status timeline","chartType":"bar","xField":"day","yField":"health","aggregation":"min","uniformBars":true,"adaptiveBucket":true,"display":{"showLegend":false,"showAxes":true,"showGrid":false,"showLabels":false}}' style="--widget-data-primary:#6fc99a;" data-default-span="6" data-default-grid-col="1" data-default-grid-row="2" data-grid-col="1" data-grid-row="2" data-grid-row-span="3"></div>
+  </div>
+
+  <div class="widget-layout" data-widget-layout-key="builder-table">
+    <div class="widget-card" data-widget-key="widget-history" data-widget-type="table" data-widget-runtime-type="table" data-widget-config='{"title":"Recent checks","columns":["checked","ip","result","ping","Δ ping","loss","Δ loss"],"sortBy":"checkedAt","sortDirection":"desc","limit":2000}' data-default-span="6" data-default-grid-col="1" data-default-grid-row="5" data-grid-col="1" data-grid-row="5" data-grid-row-span="3"></div>
+  </div>
+</div>
+
+  </main>
+  <dialog class="confirm-dialog" id="panel-delete-dialog" aria-labelledby="panel-delete-title">
+    <div class="confirm-dialog-head">
+      <span>Confirm action</span>
+      <button type="button" class="confirm-dialog-close" aria-label="Cancel deletion">x</button>
+    </div>
+    <strong id="panel-delete-title">Delete item?</strong>
+    <p id="panel-delete-message">Are you sure you want to delete this item?</p>
+    <div class="confirm-dialog-actions">
+      <button type="button" class="confirm-dialog-btn confirm-dialog-cancel">Cancel</button>
+      <button type="button" class="confirm-dialog-btn confirm-dialog-danger">Delete</button>
+    </div>
+  </dialog>
+  <div class="toast-stack" aria-live="polite" aria-atomic="true"></div>
+  <script type="module" src="./app/static/app.js"></script>
+  <script type="module" src="./app/static/status-feed.js"></script>
+  <script type="module" src="./app/static/auth-ui.js"></script>
+</body>
+</html>
