@@ -19,9 +19,9 @@ const STATUS_COLORS = {
 };
 
 const STATUS_LABELS = {
-  green: "All good",
-  yellow: "Needs attention",
-  red: "Source issue",
+  green: "No active detections",
+  yellow: "Attention needed",
+  red: "Critical detection",
   grey: "Connecting…",
   black: "No updates",
 };

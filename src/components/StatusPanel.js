@@ -4,9 +4,9 @@ import { useStatusStore, useSettingsStore } from '../store';
 // One ring, one word. The status condition is the content — everything else is
 // a single supporting line. No repeated banners, cards, or stage chips.
 const STATUS_CONFIG = {
-  green:  { accent: 'green', mark: '✓', title: 'All good' },
-  yellow: { accent: 'amber', mark: '!', title: 'Needs attention' },
-  red:    { accent: 'red',   mark: '✕', title: 'Source issue' },
+  green:  { accent: 'green', mark: '✓', title: 'No active detections' },
+  yellow: { accent: 'amber', mark: '!', title: 'Attention needed' },
+  red:    { accent: 'red',   mark: '✕', title: 'Critical detection' },
 };
 
 function formatRelative(isoString) {
@@ -142,7 +142,7 @@ function FleetPie({ query = '' }) {
   // searching with no hit, or the default prompt. Hover is cleared only when the
   // cursor leaves the WHOLE pie (see the wrapper's onMouseLeave), so crossing the
   // gap between two slices glides from one name straight to the next.
-  const centerTitle = highlightCo ? conciseLabel(highlightCo.label) : (q ? 'No match' : 'Click any slice');
+  const centerTitle = highlightCo ? conciseLabel(highlightCo.label) : (q ? 'No match' : 'Click a host');
   const centerAccent = highlightCo
     ? (highlightCo.down ? 'red' : highlightCo.degraded ? 'amber' : highlightCo.total ? 'green' : 'neutral')
     : 'neutral';
@@ -150,7 +150,7 @@ function FleetPie({ query = '' }) {
   return (
     <>
     <div className="fleet-pie-wrap" onMouseLeave={() => setHovered(null)}>
-      <svg className="fleet-pie" viewBox="0 0 220 220" role="img" aria-label="Client health, past 24 hours (derived consensus)">
+      <svg className="fleet-pie" viewBox="0 0 220 220" role="img" aria-label="Host detections, past 24 hours">
         {companies.map((co, index) => {
           const a0 = index * span + GAP / 2;
           const a1 = (index + 1) * span - GAP / 2;

@@ -1,22 +1,5 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { SettingOutlined, ArrowLeftOutlined, CloseOutlined, UserOutlined } from '@ant-design/icons';
-
-// The same account glyph the dashboard's profile button uses (auth-ui.js).
-export const AccountGlyph = () => (
-  <svg
-    className="topbar-avatar-glyph"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2.2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
-    <circle cx="12" cy="7" r="4" />
-  </svg>
-);
+import { SettingOutlined, ArrowLeftOutlined, CloseOutlined } from '@ant-design/icons';
 import StatusPanel from './components/StatusPanel';
 
 // Suppress native (OS) tooltips: strip `title` attributes (and SVG <title>)
@@ -36,10 +19,7 @@ if (typeof document !== 'undefined' && !window.__nativeTooltipsSuppressed) {
   }, true);
 }
 import Settings from './components/Settings';
-import SignIn from './components/SignIn';
-import SetPassword from './components/SetPassword';
-import Profile from './components/Profile';
-import { useStatusStore, useSettingsStore, useAuthStore } from './store';
+import { useStatusStore, useSettingsStore } from './store';
 
 // Map live status + connection state → the accent used for the top wash.
 export function resolveAccent(connectionState, status) {
@@ -52,7 +32,7 @@ export function resolveAccent(connectionState, status) {
 
 export default function App() {
   const [view, setView] = useState('status'); // 'status' | 'settings'
-  const [fleetQuery, setFleetQuery] = useState(''); // type-ahead filter for the fleet pie
+  const [fleetQuery, setFleetQuery] = useState(''); // type-ahead filter for the host pie
   const [revealing, setRevealing] = useState(false);
   const [anchorEdge, setAnchorEdge] = useState('bottom');
   const setStatus = useStatusStore((s) => s.setStatus);
@@ -62,15 +42,9 @@ export default function App() {
   const connectionState = useStatusStore((s) => s.connectionState);
   const status = useStatusStore((s) => s.status);
   const popoverMode = useStatusStore((s) => s.popoverMode);
-  const user = useAuthStore((s) => s.user);
-  const setUser = useAuthStore((s) => s.setUser);
   const panelRef = useRef(null);
 
-  // A user mid first-login password reset isn't "fully" signed in yet — no
-  // status, dashboard or settings until that's done.
-  const fullyAuthed = !!user && !user.mustChangePassword;
-  // No status is revealed until signed in (the glow stays neutral too).
-  const accent = fullyAuthed ? resolveAccent(connectionState, status) : 'neutral';
+  const accent = resolveAccent(connectionState, status);
   const isExpanded = popoverMode === 'expanded';
 
   const handlePointerEnter = () => window.electron?.pointerEntered?.();
@@ -87,16 +61,14 @@ export default function App() {
 
   // Load initial state from main process
   useEffect(() => {
-    window.electron?.getStatus().then(({ status, connectionState }) => {
-      if (status) setStatus(status);
-      setConnectionState(connectionState);
+    window.electron?.getStatus().then(({ status: snap, connectionState: cs }) => {
+      if (snap) setStatus(snap);
+      setConnectionState(cs);
     });
     window.electron?.getSettings().then((s) => { if (s) setSettings(s); });
-    window.auth?.session().then((s) => setUser(s?.user)).catch(() => {});
-    window.auth?.onChanged((s) => setUser(s?.user));
   }, []);
 
-  // Subscribe to live MQTT pushes and connection state changes
+  // Subscribe to live pushes and connection state changes
   useEffect(() => {
     window.electron?.onStatus((payload) => setStatus(payload));
     window.electron?.onConnection((state) => setConnectionState(state));
@@ -161,21 +133,20 @@ export default function App() {
 
       {isExpanded && (
         <header className="topbar">
-          {fullyAuthed && view === 'status' && (
+          {view === 'status' && (
             <input
               className="fleet-search"
               type="text"
               value={fleetQuery}
               onChange={(e) => setFleetQuery(e.target.value)}
               placeholder="Search…"
-              aria-label="Search companies"
+              aria-label="Search hosts"
               spellCheck={false}
               autoComplete="off"
             />
           )}
-          {/* Back button always sits in the top-LEFT for every submenu (settings,
-              profile) — consistent, never on the right. */}
-          {fullyAuthed && view !== 'status' && (
+          {/* Back button sits in the top-LEFT for the settings submenu. */}
+          {view !== 'status' && (
             <button
               className="icon-btn"
               onClick={() => setView('status')}
@@ -186,26 +157,14 @@ export default function App() {
             </button>
           )}
           <div className="topbar-spacer" />
-          {fullyAuthed && (
-            <button
-              className={`icon-btn profile-btn${view === 'profile' ? ' is-active' : ''}`}
-              onClick={() => setView(view === 'profile' ? 'status' : 'profile')}
-              title={`Account — ${user.username}`}
-              aria-label="Account"
-            >
-              <span className="topbar-avatar"><AccountGlyph /></span>
-            </button>
-          )}
-          {fullyAuthed && (
-            <button
-              className={`icon-btn${view === 'settings' ? ' is-active' : ''}`}
-              onClick={() => setView(view === 'settings' ? 'status' : 'settings')}
-              title="Settings"
-              aria-label="Settings"
-            >
-              <SettingOutlined />
-            </button>
-          )}
+          <button
+            className={`icon-btn${view === 'settings' ? ' is-active' : ''}`}
+            onClick={() => setView(view === 'settings' ? 'status' : 'settings')}
+            title="Settings"
+            aria-label="Settings"
+          >
+            <SettingOutlined />
+          </button>
           <button className="icon-btn" onClick={hidePopover} title="Close" aria-label="Close">
             <CloseOutlined />
           </button>
@@ -213,25 +172,9 @@ export default function App() {
       )}
 
       <div className={`panel-scroll ${isExpanded ? 'content-reveal' : ''}`}>
-        {!fullyAuthed
-          ? (!isExpanded
-            ? (
-              <div className="peek neutral">
-                <span className="peek-dot"><UserOutlined /></span>
-                <span className="peek-copy">
-                  <span className="peek-title">{user ? 'Action needed' : 'Signed out'}</span>
-                  <span className="peek-sub">{user ? 'Open to set password' : 'Open to sign in'}</span>
-                </span>
-              </div>
-            )
-            : user && user.mustChangePassword
-              ? <SetPassword />
-              : <SignIn onSignedIn={() => setView('status')} />)
-          : !isExpanded || view === 'status'
-            ? <StatusPanel mode={popoverMode} fleetQuery={fleetQuery} />
-            : view === 'profile'
-              ? <Profile onSignedOut={() => setView('status')} />
-              : <Settings onSaved={() => setView('status')} />}
+        {!isExpanded || view === 'status'
+          ? <StatusPanel mode={popoverMode} fleetQuery={fleetQuery} />
+          : <Settings onSaved={() => setView('status')} />}
       </div>
     </div>
   );
