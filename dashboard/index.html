@@ -15,7 +15,7 @@
     frame-src. blob: in worker-src is Monaco's stubbed (empty) worker.
   -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; script-src 'self' file: blob: 'unsafe-inline' 'unsafe-eval'; style-src 'self' file: 'unsafe-inline'; img-src 'self' file: data: blob: https:; font-src 'self' file: data:; connect-src 'self' file: data:; worker-src 'self' file: blob:; media-src 'self' file: blob:; frame-src https://www.youtube-nocookie.com https://player.vimeo.com; object-src 'none'; base-uri 'self'">
-  <title>Status Monitor Dashboard</title>
+  <title>ESET Alert Monitor</title>
   <script>
     (() => {
       try {
@@ -128,13 +128,13 @@
       </div>
     </div>
   </details>
-  <button class="window-glass-control control-bar-search" type="button" aria-label="Search circuits" aria-expanded="false" aria-controls="dashboard-search-popover" title="Search circuits"></button>
+  <button class="window-glass-control control-bar-search" type="button" aria-label="Search hosts" aria-expanded="false" aria-controls="dashboard-search-popover" title="Search hosts"></button>
 </div>
 <!-- Search popover: type a name or IP; matching circuit tabs appear below and
      clicking one navigates to it. Positioned under the search button by JS. -->
 <div class="dashboard-search-popover" id="dashboard-search-popover" hidden>
-  <input class="dashboard-search-input" type="text" placeholder="Search name or IP…" aria-label="Search circuits" autocomplete="off" spellcheck="false" />
-  <div class="dashboard-search-results" role="listbox" aria-label="Matching circuits"></div>
+  <input class="dashboard-search-input" type="text" placeholder="Search host…" aria-label="Search hosts" autocomplete="off" spellcheck="false" />
+  <div class="dashboard-search-results" role="listbox" aria-label="Matching hosts"></div>
 </div>
 <div class="window-control-cluster" aria-label="Window controls">
   <button class="window-glass-control window-minimize-control" type="button" aria-label="Minimize app" title="Minimize app"></button>
@@ -204,27 +204,24 @@
           <!-- Row 1 — timeframe controls, then availability: uptime, fails,
                time since last downtime. -->
           <div class="widget-card" data-widget-key="widget-timeframe" data-widget-type="timeframe" data-widget-config='{"selectedFilterId":"last_1_day","selectedPreset":"last_1_day","activeLabel":"1d"}' data-default-span="2" data-default-grid-col="1" data-default-grid-row="1" data-grid-col="1" data-grid-row="1" data-grid-row-span="1"></div>
-          <a class="stat-card widget-card" data-widget-key="widget-uptime" data-widget-type="tracker" data-widget-config='{"metric":"avg","valueField":"up","label":"Uptime %","title":"Uptime %","format":"percent","statusMode":"uptime"}' data-default-span="1" data-default-grid-col="3" data-default-grid-row="1" data-grid-col="3" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Uptime %</span></a>
-          <a class="stat-card widget-card" data-widget-key="widget-fails" data-widget-type="tracker" data-widget-config='{"metric":"count","label":"Fails","title":"Fails","format":"number","statusMode":"fails"}' data-default-span="1" data-default-grid-col="4" data-default-grid-row="1" data-grid-col="4" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Fails</span></a>
-          <a class="stat-card widget-card" data-widget-key="widget-sincedown" data-widget-type="tracker" data-widget-config='{"metric":"max","valueField":"checkedAtMs","label":"Since last downtime","title":"Since last downtime","format":"since","statusMode":"sincedown"}' data-default-span="1" data-default-grid-col="5" data-default-grid-row="1" data-grid-col="5" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">—</span><span class="stat-lbl">Since last downtime</span></a>
-          <!-- Row 2 — latency trio then packet-loss trio. -->
-          <a class="stat-card widget-card" data-widget-key="widget-avgms" data-widget-type="tracker" data-widget-config='{"metric":"avg","valueField":"latencyMs","label":"Avg ms","title":"Avg ms","format":"number","statusMode":"latency-avg"}' data-default-span="1" data-default-grid-col="1" data-default-grid-row="2" data-grid-col="1" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Avg ms</span></a>
-          <a class="stat-card widget-card" data-widget-key="widget-minms" data-widget-type="tracker" data-widget-config='{"metric":"min","valueField":"latencyMs","label":"Min ms","title":"Min ms","format":"number","statusMode":"latency-min"}' data-default-span="1" data-default-grid-col="2" data-default-grid-row="2" data-grid-col="2" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Min ms</span></a>
-          <a class="stat-card widget-card" data-widget-key="widget-maxms" data-widget-type="tracker" data-widget-config='{"metric":"max","valueField":"latencyMs","label":"Max ms","title":"Max ms","format":"number","statusMode":"latency-max"}' data-default-span="1" data-default-grid-col="3" data-default-grid-row="2" data-grid-col="3" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Max ms</span></a>
-          <a class="stat-card widget-card" data-widget-key="widget-loss" data-widget-type="tracker" data-widget-config='{"metric":"avg","valueField":"packetLossPct","label":"Avg loss %","title":"Avg loss %","format":"number","statusMode":"loss-avg"}' data-default-span="1" data-default-grid-col="4" data-default-grid-row="2" data-grid-col="4" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Avg loss %</span></a>
-          <a class="stat-card widget-card" data-widget-key="widget-lossmin" data-widget-type="tracker" data-widget-config='{"metric":"min","valueField":"packetLossPct","label":"Min loss %","title":"Min loss %","format":"number","statusMode":"loss-min"}' data-default-span="1" data-default-grid-col="5" data-default-grid-row="2" data-grid-col="5" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Min loss %</span></a>
-          <a class="stat-card widget-card" data-widget-key="widget-lossmax" data-widget-type="tracker" data-widget-config='{"metric":"max","valueField":"packetLossPct","label":"Max loss %","title":"Max loss %","format":"number","statusMode":"loss-max"}' data-default-span="1" data-default-grid-col="6" data-default-grid-row="2" data-grid-col="6" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Max loss %</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-uptime" data-widget-type="tracker" data-widget-config='{"metric":"avg","valueField":"up","label":"Resolved %","title":"Resolved %","format":"percent","statusMode":"uptime"}' data-default-span="1" data-default-grid-col="3" data-default-grid-row="1" data-grid-col="3" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Resolved %</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-fails" data-widget-type="tracker" data-widget-config='{"metric":"count","label":"Open","title":"Open","format":"number","statusMode":"fails"}' data-default-span="1" data-default-grid-col="4" data-default-grid-row="1" data-grid-col="4" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Open</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-sincedown" data-widget-type="tracker" data-widget-config='{"metric":"max","valueField":"checkedAtMs","label":"Last detection","title":"Last detection","format":"since","statusMode":"sincedown"}' data-default-span="1" data-default-grid-col="5" data-default-grid-row="1" data-grid-col="5" data-grid-row="1" data-grid-row-span="1" href="#"><span class="stat-val">—</span><span class="stat-lbl">Last detection</span></a>
+          <!-- Row 2 — detection totals and score range. -->
+          <a class="stat-card widget-card" data-widget-key="widget-minms" data-widget-type="tracker" data-widget-config='{"metric":"count","valueField":"score","label":"Total","title":"Total","format":"number"}' data-default-span="1" data-default-grid-col="1" data-default-grid-row="2" data-grid-col="1" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Total</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-avgms" data-widget-type="tracker" data-widget-config='{"metric":"avg","valueField":"score","label":"Avg score","title":"Avg score","format":"number"}' data-default-span="1" data-default-grid-col="2" data-default-grid-row="2" data-grid-col="2" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Avg score</span></a>
+          <a class="stat-card widget-card" data-widget-key="widget-maxms" data-widget-type="tracker" data-widget-config='{"metric":"max","valueField":"score","label":"Max score","title":"Max score","format":"number"}' data-default-span="1" data-default-grid-col="3" data-default-grid-row="2" data-grid-col="3" data-grid-row="2" data-grid-row-span="1" href="#"><span class="stat-val">0</span><span class="stat-lbl">Max score</span></a>
         </div>
       </div>
     </section>
   </div>
 
   <div class="widget-layout" data-widget-layout-key="builder-chart">
-    <div class="widget-card" data-widget-key="widget-trend" data-widget-type="graph" data-widget-runtime-type="chart" data-widget-config='{"title":"Status timeline","chartType":"bar","xField":"day","yField":"health","aggregation":"min","uniformBars":true,"adaptiveBucket":true,"display":{"showLegend":false,"showAxes":true,"showGrid":false,"showLabels":false}}' style="--widget-data-primary:#6fc99a;" data-default-span="6" data-default-grid-col="1" data-default-grid-row="2" data-grid-col="1" data-grid-row="2" data-grid-row-span="3"></div>
+    <div class="widget-card" data-widget-key="widget-trend" data-widget-type="graph" data-widget-runtime-type="chart" data-widget-config='{"title":"Detections over time","chartType":"bar","xField":"day","yField":"score","aggregation":"avg","uniformBars":true,"adaptiveBucket":true,"display":{"showLegend":false,"showAxes":true,"showGrid":false,"showLabels":false}}' style="--widget-data-primary:#6fc99a;" data-default-span="6" data-default-grid-col="1" data-default-grid-row="2" data-grid-col="1" data-grid-row="2" data-grid-row-span="3"></div>
   </div>
 
   <div class="widget-layout" data-widget-layout-key="builder-table">
-    <div class="widget-card" data-widget-key="widget-history" data-widget-type="table" data-widget-runtime-type="table" data-widget-config='{"title":"Recent checks","columns":["checked","ip","result","ping","Δ ping","loss","Δ loss"],"sortBy":"checkedAt","sortDirection":"desc","limit":2000}' data-default-span="6" data-default-grid-col="1" data-default-grid-row="5" data-grid-col="1" data-grid-row="5" data-grid-row-span="3"></div>
+    <div class="widget-card" data-widget-key="widget-history" data-widget-type="table" data-widget-runtime-type="table" data-widget-config='{"title":"Detections","columns":["Time","Host","Threat","User","Severity","Score","State"],"sortBy":"checkedAt","sortDirection":"desc","limit":2000}' data-default-span="6" data-default-grid-col="1" data-default-grid-row="5" data-grid-col="1" data-grid-row="5" data-grid-row-span="3"></div>
   </div>
 </div>
 

@@ -160,6 +160,11 @@ function checkToPing(p) {
     checkId: p.id || '',
     host: p.host || '',
     detail: bits.join(' · '),
+    // ESET detection fields carried through to the dashboard table/cards.
+    threat: p.threat || '',
+    severity: p.severity || '',
+    score: p.score != null ? p.score : null,
+    user: p.user || '',
   };
 }
 
@@ -523,6 +528,10 @@ function detectionToCheck(d, checkedAt, scored) {
     label: host,
     host,
     error: d.resolved === true ? '' : detail,
+    threat,
+    severity: scored ? scored.severity : '',
+    score: scored ? scored.score : null,
+    user: d.userName || d.responsibleUser || '',
     checkedAt,
   };
 }

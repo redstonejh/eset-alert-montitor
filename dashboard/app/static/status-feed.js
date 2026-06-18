@@ -372,6 +372,17 @@ const historyRow = (entry) => ({
   health: entry.status === "green" ? 100 : entry.status === "yellow" ? 50 : 0,
   // Kept for back-compat with any chart that referenced the old field.
   value: entry.status === "green" ? 100 : entry.status === "yellow" ? 50 : 0,
+  // ESET detection columns (capitalized keys render as table headers) plus the
+  // numeric score for the stat cards and chart.
+  Time: formatChecked(entry.checkedAt),
+  Host: entry.host || "",
+  Threat: entry.threat || "",
+  User: entry.user || "",
+  Severity: entry.severity || "",
+  Score: entry.score != null ? entry.score : "",
+  State: entry.status === "red" ? "Open" : entry.status === "green" ? "Resolved" : "—",
+  score: entry.score != null ? Number(entry.score) : null,
+  severity: entry.severity || "",
 });
 
 function currentStatusRow() {
@@ -691,29 +702,28 @@ function publish() {
   // The Metrics panel carries a fixed title on every tab.
   const metricsPanel = document.querySelector('.db-panel[data-panel-key="builder-metrics"]');
   const metricsTitle = metricsPanel?.querySelector(':scope > .db-panel-hd > .db-panel-title');
-  if (metricsTitle && metricsTitle.textContent !== "Metrics & Controls") {
-    metricsTitle.textContent = "Metrics & Controls";
+  if (metricsTitle && metricsTitle.textContent !== "Summary") {
+    metricsTitle.textContent = "Summary";
   }
   // The Metrics panel launches on the white scheme like the viewer panels.
   window.dashboardViewerPanels?.forceWhite?.(metricsPanel);
 
   // Stat cards stay a per-company aggregate over every viewer's pings (unchanged).
   const widgets = {
-    "widget-uptime": { rows },                // Uptime %   = avg(up)
-    "widget-avgms": { rows: latencyRows, meta: baselineMeta },  // Avg ms = avg(latencyMs) + Δ vs broader
-    "widget-minms": { rows: latencyRows },    // Min ms     = min(latencyMs)
-    "widget-maxms": { rows: latencyRows },    // Max ms     = max(latencyMs)
-    "widget-loss": { rows: latencyRows, meta: baselineMeta },   // Avg loss % = avg(packetLossPct) + Δ vs broader
-    "widget-lossmin": { rows: latencyRows },  // Min loss % = min(packetLossPct)
-    "widget-lossmax": { rows: latencyRows },  // Max loss % = max(packetLossPct)
-    "widget-fails": { rows: failRows },       // Fails      = count(down)
-    "widget-sincedown": { rows: failRows },   // Since down = max(checkedAtMs) of fails
+    "widget-uptime": { rows },                // Resolved %  = avg(up)
+    "widget-avgms": { rows },                 // Avg score   = avg(score)
+    "widget-minms": { rows },                 // Total       = count(rows)
+    "widget-maxms": { rows },                 // Max score   = max(score)
+    "widget-fails": { rows: failRows },       // Open        = count(open detections)
+    "widget-sincedown": { rows: failRows },   // Last detection = max(checkedAtMs) of open
   };
 
   // EVERY tab (1, 2, or 3+ viewers) shows its viewers as panels beneath the
   // chart — Grayson Fiber is the source of truth — so the single default table
   // is always hidden when there's at least one viewer.
-  const hasViewers = viewers.length >= 1;
+  // ESET detections have no multi-viewer redundancy — always use the single
+  // default detections table (no per-viewer sub-panels).
+  const hasViewers = false;
   const defaultTable = document.querySelector('.widget-layout[data-widget-layout-key="builder-table"]');
   if (defaultTable) defaultTable.style.display = hasViewers ? "none" : "";
 
