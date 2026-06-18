@@ -228,7 +228,24 @@ export default function App() {
               ? <SetPassword />
               : <SignIn onSignedIn={() => setView('status')} />)
           : !isExpanded || view === 'status'
-            ? <StatusPanel mode={popoverMode} fleetQuery={fleetQuery} />
+            ? (
+              <>
+                <StatusPanel mode={popoverMode} fleetQuery={fleetQuery} />
+                {isExpanded && (
+                  <div className="dash-row">
+                    <button
+                      className="icon-btn open-dash"
+                      onClick={() => window.electron?.openDashboard?.()}
+                      title="Open dashboard"
+                      aria-label="Open dashboard"
+                    >
+                      <span className="open-dash-label">Open dashboard</span>
+                      <span className="chev">▾</span>
+                    </button>
+                  </div>
+                )}
+              </>
+            )
             : view === 'profile'
               ? <Profile onSignedOut={() => setView('status')} />
               : <Settings onSaved={() => setView('status')} />}

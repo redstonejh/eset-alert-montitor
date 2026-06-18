@@ -214,6 +214,8 @@ body.win-acrylic .panel.peek { border-radius: 0; }
 .open-dash:active { transform: translateY(0); }
 .open-dash .chev { font-size: 12px; }
 .open-dash-label { letter-spacing: 0.01em; }
+/* Centered row holding the Open-dashboard pill below the status. */
+.dash-row { display: flex; justify-content: center; padding: 2px 12px 14px; }
 
 /* ─── Status hero — centered condition, minimal words ────────────────────── */
 
