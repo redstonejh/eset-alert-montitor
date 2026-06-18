@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { fetchDetections } from './eset-source.js';
+import { scoreDetection } from './eset-scoring.js';
 import squirrelStartup from 'electron-squirrel-startup';
 import { icons } from './icons';
 import auth from './auth.js';
@@ -509,16 +510,19 @@ const ESET_SYSTEM = 'eset/connect';
 // one reads as up (green). The detection's device is the "company" (it drives the
 // same companyForCheck grouping). Each poll re-states the current detection status
 // as of now, mirroring the periodic check cadence MQTT delivered.
-function detectionToCheck(d, checkedAt) {
+function detectionToCheck(d, checkedAt, scored) {
   const device = d.device || {};
   const host = device.displayName || device.hostname || d.deviceName || 'Unknown device';
   const threat = d.displayName || d.detectionName || d.typeName || d.objectTypeName || 'Detection';
+  // The threat name and its scored severity ride along in the existing "error"
+  // field, which the popover detail line and the dashboard table already show.
+  const detail = scored ? `${threat} · ${scored.severity} (${scored.score})` : threat;
   return {
     available: d.resolved === true,
     id: d.uuid || d.id || `${host}:${threat}`,
     label: host,
     host,
-    error: d.resolved === true ? '' : threat,
+    error: d.resolved === true ? '' : detail,
     checkedAt,
   };
 }
@@ -541,7 +545,8 @@ async function pollEset() {
   // The poller is the live agent — mark it active so its company stays online.
   systemActivity.set(ESET_SYSTEM, polledAt.getTime());
   for (const d of detections) {
-    const res = ingestCheck(detectionToCheck(d, checkedAt), ESET_SYSTEM);
+    const scored = scoreDetection(d, detections);
+    const res = ingestCheck(detectionToCheck(d, checkedAt, scored), ESET_SYSTEM);
     if (res) broadcastCheck(res.companyId, res.ping);
   }
 
