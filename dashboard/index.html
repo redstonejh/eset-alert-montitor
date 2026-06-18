@@ -44,6 +44,23 @@
       } catch {}
     })();
   </script>
+  <script>
+    // Default-layout version. The builder persists the user's layout, which would
+    // otherwise hide changes to the bundled default (e.g. the Alerts + Escalations
+    // panels). Bump this whenever the default layout changes: on the next launch a
+    // stale saved layout is cleared so the markup default below loads fresh.
+    (() => {
+      try {
+        const LAYOUT_VERSION = "2";
+        const p = window.dashboardPersistence;
+        if (p && p.getItem("eset-layout-version") !== LAYOUT_VERSION) {
+          p.removeItem("dashboard-panel-profile:builder");
+          p.removeItem("dashboard-workspace-pages:builder");
+          p.setItem("eset-layout-version", LAYOUT_VERSION);
+        }
+      } catch {}
+    })();
+  </script>
   <style>
     html[data-dashboard-booting] .page,
     html[data-dashboard-booting] .toast-stack,
